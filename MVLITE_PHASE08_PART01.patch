@@ -1,0 +1,381 @@
+--- app.py
++++ app.py
+@@ -277,10 +277,58 @@
+         ("qty", "ALTER TABLE orders ADD COLUMN qty INTEGER DEFAULT 1"),
+         ("delivery_text", "ALTER TABLE orders ADD COLUMN delivery_text TEXT DEFAULT ''"),
+         ("updated_at", "ALTER TABLE orders ADD COLUMN updated_at TEXT DEFAULT ''"),
++        ("product_title_snapshot", "ALTER TABLE orders ADD COLUMN product_title_snapshot TEXT DEFAULT ''"),
++        ("voucher_amount_snapshot", "ALTER TABLE orders ADD COLUMN voucher_amount_snapshot REAL DEFAULT 0"),
++        ("currency_symbol_snapshot", "ALTER TABLE orders ADD COLUMN currency_symbol_snapshot TEXT DEFAULT ''"),
++        ("currency_price_snapshot", "ALTER TABLE orders ADD COLUMN currency_price_snapshot REAL DEFAULT 0"),
++        ("price_source_snapshot", "ALTER TABLE orders ADD COLUMN price_source_snapshot TEXT DEFAULT ''"),
++        ("base_price_snapshot", "ALTER TABLE orders ADD COLUMN base_price_snapshot INTEGER DEFAULT 0"),
++        ("visible_fee", "ALTER TABLE orders ADD COLUMN visible_fee INTEGER DEFAULT 0"),
++        ("profit_amount", "ALTER TABLE orders ADD COLUMN profit_amount INTEGER DEFAULT 0"),
++        ("purchase_price", "ALTER TABLE orders ADD COLUMN purchase_price INTEGER DEFAULT 0"),
++        ("original_amount", "ALTER TABLE orders ADD COLUMN original_amount INTEGER DEFAULT 0"),
++        ("final_amount", "ALTER TABLE orders ADD COLUMN final_amount INTEGER DEFAULT 0"),
++        ("admin_note", "ALTER TABLE orders ADD COLUMN admin_note TEXT DEFAULT ''"),
++        ("user_message", "ALTER TABLE orders ADD COLUMN user_message TEXT DEFAULT ''"),
++        ("reject_reason", "ALTER TABLE orders ADD COLUMN reject_reason TEXT DEFAULT ''"),
++        ("cancel_reason", "ALTER TABLE orders ADD COLUMN cancel_reason TEXT DEFAULT ''"),
++        ("processing_at", "ALTER TABLE orders ADD COLUMN processing_at TEXT DEFAULT ''"),
++        ("ready_at", "ALTER TABLE orders ADD COLUMN ready_at TEXT DEFAULT ''"),
++        ("delivered_at", "ALTER TABLE orders ADD COLUMN delivered_at TEXT DEFAULT ''"),
++        ("completed_at", "ALTER TABLE orders ADD COLUMN completed_at TEXT DEFAULT ''"),
++        ("refunded_at", "ALTER TABLE orders ADD COLUMN refunded_at TEXT DEFAULT ''"),
++        ("cancelled_at", "ALTER TABLE orders ADD COLUMN cancelled_at TEXT DEFAULT ''"),
++        ("refund_amount", "ALTER TABLE orders ADD COLUMN refund_amount INTEGER DEFAULT 0"),
++        ("refund_tx_id", "ALTER TABLE orders ADD COLUMN refund_tx_id INTEGER DEFAULT 0"),
++        ("delivery_mode_snapshot", "ALTER TABLE orders ADD COLUMN delivery_mode_snapshot TEXT DEFAULT 'manual'"),
+     ]:
+         try: c.execute(ddl)
+         except sqlite3.OperationalError: pass
+ 
++    c.execute("""CREATE TABLE IF NOT EXISTS order_status_history (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        order_id INTEGER NOT NULL,
++        old_status TEXT DEFAULT '',
++        new_status TEXT NOT NULL,
++        actor_type TEXT DEFAULT 'system',
++        actor_id INTEGER DEFAULT 0,
++        reason TEXT DEFAULT '',
++        created_at TEXT NOT NULL,
++        FOREIGN KEY(order_id) REFERENCES orders(id)
++    )""")
++
++    c.execute("""CREATE TABLE IF NOT EXISTS order_refunds (
++        id INTEGER PRIMARY KEY AUTOINCREMENT,
++        order_id INTEGER NOT NULL UNIQUE,
++        user_id INTEGER NOT NULL,
++        amount INTEGER NOT NULL,
++        wallet_tx_id INTEGER DEFAULT 0,
++        admin_id INTEGER DEFAULT 0,
++        reason TEXT DEFAULT '',
++        created_at TEXT NOT NULL,
++        FOREIGN KEY(order_id) REFERENCES orders(id)
++    )""")
++
+     c.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
+         id INTEGER PRIMARY KEY AUTOINCREMENT,
+         admin_tg_id INTEGER NOT NULL,
+@@ -554,6 +602,9 @@
+         "CREATE INDEX IF NOT EXISTS idx_products_active ON products(is_active)",
+         "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)",
+         "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
++        "CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code)",
++        "CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_id)",
++        "CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_status_history(order_id,id)",
+         "CREATE INDEX IF NOT EXISTS idx_payments_user ON payment_requests(user_id)",
+         "CREATE INDEX IF NOT EXISTS idx_payments_status ON payment_requests(status)",
+         "CREATE INDEX IF NOT EXISTS idx_tickets_user ON tickets(user_id)",
+@@ -1745,6 +1796,50 @@
+     buttons.append([btn("🔙 تنظیم قیمت",f"admin:prod_price_settings:{prod_id}")])
+     return f"💱 <b>انتخاب نماد برای محصول #{prod_id}</b>\n\nتعداد نمادهای فعال: <b>{total}</b>\nصفحه: <b>{page+1}</b>",kb(buttons)
+ 
++ORDER_STATUS_LABELS = {
++    "pending": "در انتظار پردازش",
++    "pending_processing": "در انتظار پردازش",
++    "processing": "در حال پردازش",
++    "ready": "آماده تحویل",
++    "delivered": "تحویل‌شده",
++    "completed": "تکمیل‌شده",
++    "done": "تکمیل‌شده",
++    "rejected": "ردشده",
++    "cancelled": "لغوشده",
++    "refunded": "بازگشت وجه‌شده",
++}
++
++
++def order_status_label(status):
++    return ORDER_STATUS_LABELS.get(str(status or ""), str(status or "-"))
++
++
++def add_order_status_history(conn, order_id, old_status, new_status, actor_type="system", actor_id=0, reason=""):
++    conn.execute("""INSERT INTO order_status_history(
++                    order_id,old_status,new_status,actor_type,actor_id,reason,created_at)
++                    VALUES(?,?,?,?,?,?,?)""",
++                 (order_id, old_status or "", new_status, actor_type, int(actor_id or 0), reason or "", now()))
++
++
++def set_order_status(conn, order_id, new_status, actor_type="system", actor_id=0, reason=""):
++    row=conn.execute("SELECT status FROM orders WHERE id=?",(order_id,)).fetchone()
++    if not row:
++        return False
++    old_status=row["status"] or ""
++    if old_status == new_status:
++        return True
++    timestamp_col={
++        "processing":"processing_at", "ready":"ready_at", "delivered":"delivered_at",
++        "completed":"completed_at", "cancelled":"cancelled_at", "refunded":"refunded_at"
++    }.get(new_status)
++    if timestamp_col:
++        conn.execute(f"UPDATE orders SET status=?, {timestamp_col}=?, updated_at=? WHERE id=?",
++                     (new_status,now(),now(),order_id))
++    else:
++        conn.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?",(new_status,now(),order_id))
++    add_order_status_history(conn,order_id,old_status,new_status,actor_type,actor_id,reason)
++    return True
++
+ # -------------------- Render --------------------
+ 
+ def render_profile(u):
+@@ -1856,7 +1951,7 @@
+ مبلغ: <b>{money(o['amount'])}</b> تومان
+ تخفیف: <b>{money(o['discount_amount'] if 'discount_amount' in o.keys() else 0)}</b> تومان
+ کد تخفیف: <code>{html_escape(o['coupon_code'] if 'coupon_code' in o.keys() else '')}</code>
+-وضعیت: <b>{o['status']}</b>
++وضعیت: <b>{order_status_label(o['status'])}</b>
+ تاریخ: {o['created_at']}
+ 
+ تحویل:
+@@ -2941,7 +3036,7 @@
+     lines.append("")
+     lines.append("Last Orders:")
+     for o in last_orders:
+-        lines.append(f"- {o['order_code']} | user:{o['user_id']} | {o['amount']} | {o['status']} | {o['created_at']}")
++        lines.append(f"- {o['order_code']} | user:{o['user_id']} | {o['amount']} | {order_status_label(o['status'])} | {o['created_at']}")
+     return "\n".join(lines)
+ 
+ def quick_search_menu():
+@@ -2990,7 +3085,7 @@
+     lines = [f"🧾 نتایج جستجوی سفارش: {html_escape(q)}\n"]
+     buttons = []
+     for o in rows:
+-        lines.append(f"#{o['id']} | {o['order_code']} | user:{o['user_id']} | {money(o['amount'])} | {o['status']}")
++        lines.append(f"#{o['id']} | {o['order_code']} | user:{o['user_id']} | {money(o['amount'])} | {order_status_label(o['status'])}")
+         buttons.append([btn(f"#{o['id']} {o['order_code']}", f"admin:order:{o['id']}")])
+     buttons.append([btn("🔙 جستجوی سریع", "admin:quick_search")])
+     return send_message(chat_id, "\n".join(lines), kb(buttons))
+@@ -3443,7 +3538,7 @@
+ مبلغ: <b>{money(o['amount'])}</b> تومان
+ تخفیف: <b>{money(o['discount_amount'] if 'discount_amount' in o.keys() else 0)}</b> تومان
+ کد تخفیف: <code>{html_escape(o['coupon_code'] if 'coupon_code' in o.keys() else '')}</code>
+-وضعیت: <b>{o['status']}</b>
++وضعیت: <b>{order_status_label(o['status'])}</b>
+ تاریخ: {o['created_at']}
+ 
+ تحویل:
+@@ -3462,71 +3557,100 @@
+     lines=["📦 <b>سفارش‌های من</b>\n"]
+     buttons=[]
+     for o in rows:
+-        lines.append(f"• <code>{o['order_code']}</code> | {html_escape(o['product_title'] or '-')} | {o['status']}")
+-        buttons.append([btn(f"{o['order_code']} | {o['status']}", f"my_order:{o['id']}")])
++        lines.append(f"• <code>{o['order_code']}</code> | {html_escape(o['product_title'] or '-')} | {order_status_label(o['status'])}")
++        buttons.append([btn(f"{o['order_code']} | {order_status_label(o['status'])}", f"my_order:{o['id']}")])
+     buttons.append([btn("🏠 خانه","main")])
+     return edit_message(chat_id,message_id,"\n".join(lines),kb(buttons))
+ 
+ 
+ def finalize_purchase(chat_id, message_id, tg_id, prod_id, coupon_code=""):
+     conn=db()
+-    p=conn.execute("SELECT * FROM products WHERE id=? AND is_active=1",(prod_id,)).fetchone()
+-    user=conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+-    if not p:
+-        conn.close(); return edit_message(chat_id,message_id,"محصول پیدا نشد.",back_main())
+-    symbol=get_bound_api_symbol(conn,p)
+-    effective_price, price_source=calculate_product_price_from_rows(p,symbol)
+-    if effective_price <= 0:
+-        conn.close()
+-        msgtxt="❌ قیمت این محصول در حال حاضر قابل محاسبه نیست. لطفاً با پشتیبانی تماس بگیرید."
+-        markup=kb([[btn("📞 پشتیبانی","support")],[btn("🔙 برگشت",f"product:{prod_id}")]])
+-        return send_message(chat_id,msgtxt,markup) if not message_id else edit_message(chat_id,message_id,msgtxt,markup)
+-    coupon=None; discount=0; coupon_err=""
+-    if coupon_code:
+-        coupon=conn.execute("SELECT * FROM coupons WHERE lower(code)=lower(?)",(coupon_code.strip(),)).fetchone()
+-        discount, coupon_err = calc_coupon_discount(coupon, effective_price)
+-        if coupon_err:
+-            conn.close()
+-            return send_message(chat_id,f"❌ {html_escape(coupon_err)}",kb([[btn("🔙 برگشت",f"product:{prod_id}")]])) if not message_id else edit_message(chat_id,message_id,f"❌ {html_escape(coupon_err)}",kb([[btn("🔙 برگشت",f"product:{prod_id}")]]))
+-    final_amount = effective_price - discount
+-    if user["balance"] < final_amount:
+-        conn.close()
+-        msgtxt=f"❌ موجودی کافی نیست.\n\nقیمت: {money(effective_price)} تومان\nتخفیف: {money(discount)} تومان\nقابل پرداخت: {money(final_amount)} تومان\nموجودی شما: {money(user['balance'])} تومان"
+-        markup=kb([[btn("➕ شارژ کیف پول","wallet_topup")],[btn("🔙 برگشت",f"product:{prod_id}")]])
+-        return send_message(chat_id,msgtxt,markup) if not message_id else edit_message(chat_id,message_id,msgtxt,markup)
+-    code=short_code("MV")
+-    mode=p["stock_mode"] or "manual"
+-    if mode == "unlimited":
+-        status = "done"
+-        delivery = p["delivery_text"] or ""
+-    elif mode == "code":
+-        available_count = conn.execute("SELECT COUNT(*) n FROM product_codes WHERE product_id=? AND status='available'", (prod_id,)).fetchone()["n"]
+-        if available_count <= 0:
+-            conn.close()
+-            msgtxt = "❌ موجودی کد این محصول تمام شده است. لطفاً بعداً تلاش کنید یا با پشتیبانی تماس بگیرید."
+-            markup = kb([[btn("📞 پشتیبانی","support")],[btn("🔙 برگشت",f"product:{prod_id}")]])
++    try:
++        conn.execute("BEGIN IMMEDIATE")
++        p=conn.execute("SELECT * FROM products WHERE id=? AND is_active=1",(prod_id,)).fetchone()
++        user=conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
++        if not p or not user:
++            conn.rollback()
++            return edit_message(chat_id,message_id,"محصول یا کاربر پیدا نشد.",back_main())
++
++        symbol=get_bound_api_symbol(conn,p)
++        effective_price, price_source=calculate_product_price_from_rows(p,symbol)
++        if effective_price <= 0:
++            conn.rollback()
++            msgtxt="❌ قیمت این محصول در حال حاضر قابل محاسبه نیست. لطفاً با پشتیبانی تماس بگیرید."
++            markup=kb([[btn("📞 پشتیبانی","support")],[btn("🔙 برگشت",f"product:{prod_id}")]])
+             return send_message(chat_id,msgtxt,markup) if not message_id else edit_message(chat_id,message_id,msgtxt,markup)
+-        status = "done"
+-        delivery = ""
+-    else:
+-        status = "pending"
+-        delivery = ""
+-    conn.execute("UPDATE users SET balance=balance-? WHERE tg_id=?", (final_amount, tg_id))
+-    conn.execute("""INSERT INTO orders(order_code,user_id,product_id,amount,status,note,qty,delivery_text,created_at,updated_at,coupon_code,discount_amount)
+-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+-                 (code,tg_id,prod_id,final_amount,status,"خرید با کیف پول",1,delivery,now(),now(),coupon_code or "",discount))
+-    order_id=conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+-    if mode == "code":
+-        code_text = take_product_code(conn, prod_id, order_id, tg_id)
+-        delivery = code_text
+-        conn.execute("UPDATE orders SET delivery_text=? WHERE id=?", (delivery, order_id))
+-    add_wallet_tx(conn,tg_id,-final_amount,"purchase","order",order_id,f"خرید {p['title']}")
+-    if coupon and discount:
+-        conn.execute("UPDATE coupons SET used_count=used_count+1 WHERE id=?", (coupon["id"],))
+-        conn.execute("""INSERT INTO coupon_usages(coupon_id,user_id,order_id,discount_amount,created_at)
+-                        VALUES(?,?,?,?,?)""", (coupon["id"],tg_id,order_id,discount,now()))
+-    conn.commit(); conn.close()
+-    text=f"✅ سفارش ثبت شد.\n\nکد سفارش: <code>{code}</code>\nقیمت اصلی: {money(effective_price)} تومان\nتخفیف: {money(discount)} تومان\nپرداخت‌شده: <b>{money(final_amount)}</b> تومان\nوضعیت: <b>{status}</b>"
++
++        coupon=None; discount=0
++        if coupon_code:
++            coupon=conn.execute("SELECT * FROM coupons WHERE lower(code)=lower(?)",(coupon_code.strip(),)).fetchone()
++            discount, coupon_err = calc_coupon_discount(coupon, effective_price)
++            if coupon_err:
++                conn.rollback()
++                return edit_message(chat_id,message_id,f"❌ {html_escape(coupon_err)}",kb([[btn("🔙 برگشت",f"product:{prod_id}")]]))
++
++        final_amount=max(0,effective_price-discount)
++        if int(user["balance"] or 0) < final_amount:
++            conn.rollback()
++            msgtxt=f"❌ موجودی کافی نیست.\n\nقیمت ووچر: {money(effective_price)} تومان\nتخفیف: {money(discount)} تومان\nمبلغ نهایی: {money(final_amount)} تومان\nموجودی شما: {money(user['balance'])} تومان"
++            markup=kb([[btn("➕ شارژ کیف پول","wallet_topup")],[btn("🔙 برگشت",f"product:{prod_id}")]])
++            return edit_message(chat_id,message_id,msgtxt,markup)
++
++        mode=(p["stock_mode"] or "manual").lower()
++        if mode == "code":
++            available_count=conn.execute("SELECT COUNT(*) n FROM product_codes WHERE product_id=? AND status='available'",(prod_id,)).fetchone()["n"]
++            if available_count <= 0:
++                conn.rollback()
++                return edit_message(chat_id,message_id,"❌ موجودی کد این محصول تمام شده است.",kb([[btn("📞 پشتیبانی","support")],[btn("🔙 برگشت",f"product:{prod_id}")]]))
++
++        currency_price=float(symbol["price"] or 0) if symbol else 0.0
++        currency_symbol=(symbol["symbol"] or "") if symbol else ""
++        multiplier=float(p["price_multiplier"] or 1)
++        base_price=round(currency_price*multiplier) if product_price_mode(p)=="online" and currency_price>0 else int(p["price"] or effective_price)
++        visible_fee=int(p["fixed_fee"] or 0) if product_price_mode(p)=="online" else 0
++        purchase_price=max(0,int(base_price))
++        profit_amount=max(0,int(effective_price)-purchase_price-visible_fee)
++        status="delivered" if mode in ("unlimited","code") else "pending_processing"
++        delivery=(p["delivery_text"] or "") if mode=="unlimited" else ""
++        code=short_code("MV")
++
++        updated=conn.execute("UPDATE users SET balance=balance-? WHERE tg_id=? AND balance>=?",(final_amount,tg_id,final_amount)).rowcount
++        if updated != 1:
++            conn.rollback()
++            return edit_message(chat_id,message_id,"❌ موجودی کافی نیست یا خرید هم‌زمان دیگری انجام شده است.",back_main())
++
++        created=now()
++        conn.execute("""INSERT INTO orders(
++            order_code,user_id,product_id,amount,status,note,qty,delivery_text,created_at,updated_at,coupon_code,discount_amount,
++            product_title_snapshot,voucher_amount_snapshot,currency_symbol_snapshot,currency_price_snapshot,price_source_snapshot,
++            base_price_snapshot,visible_fee,profit_amount,purchase_price,original_amount,final_amount,delivery_mode_snapshot,delivered_at)
++            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
++            (code,tg_id,prod_id,final_amount,status,"خرید با کیف پول",1,delivery,created,created,coupon_code or "",discount,
++             p["title"] or "",multiplier,currency_symbol,currency_price,price_source,purchase_price,visible_fee,profit_amount,
++             purchase_price,effective_price,final_amount,mode,created if status=="delivered" else ""))
++        order_id=conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
++        add_order_status_history(conn,order_id,"",status,"user",tg_id,"ثبت خرید")
++
++        if mode == "code":
++            delivery=take_product_code(conn,prod_id,order_id,tg_id)
++            if not delivery:
++                raise RuntimeError("کد موجودی قابل رزرو نبود")
++            conn.execute("UPDATE orders SET delivery_text=? WHERE id=?",(delivery,order_id))
++
++        add_wallet_tx(conn,tg_id,-final_amount,"purchase","order",order_id,f"خرید {p['title']}")
++        if coupon and discount:
++            conn.execute("UPDATE coupons SET used_count=used_count+1 WHERE id=?",(coupon["id"],))
++            conn.execute("INSERT INTO coupon_usages(coupon_id,user_id,order_id,discount_amount,created_at) VALUES(?,?,?,?,?)",
++                         (coupon["id"],tg_id,order_id,discount,created))
++        conn.commit()
++    except Exception as exc:
++        conn.rollback()
++        print("PURCHASE ERROR:",repr(exc))
++        return edit_message(chat_id,message_id,"❌ ثبت سفارش کامل نشد و هیچ مبلغی کسر نشد. دوباره تلاش کنید.",back_main())
++    finally:
++        conn.close()
++
++    text=f"✅ سفارش ثبت شد.\n\nکد سفارش: <code>{code}</code>\nقیمت ووچر: {money(effective_price)} تومان\nکارمزد: {money(visible_fee)} تومان\nتخفیف: {money(discount)} تومان\nمبلغ نهایی: <b>{money(final_amount)}</b> تومان\nوضعیت: <b>{order_status_label(status)}</b>"
+     if delivery:
+         text += f"\n\n🚚 تحویل:\n{html_escape(delivery)}"
+     markup=kb([[btn("📦 سفارش‌های من","my_orders")],[btn("🏠 خانه","main")]])
+@@ -3548,7 +3672,7 @@
+     if not rows: return edit_message(chat_id,message_id,"🧾 سفارشی ثبت نشده است.",admin_back())
+     lines=["🧾 <b>آخرین سفارش‌ها</b>\n"]; buttons=[]
+     for o in rows:
+-        lines.append(f"#{o['id']} | <code>{o['order_code']}</code> | user:{o['user_id']} | {html_escape(o['product_title'] or '-')} | {o['status']}")
++        lines.append(f"#{o['id']} | <code>{o['order_code']}</code> | user:{o['user_id']} | {html_escape(o['product_title'] or '-')} | {order_status_label(o['status'])}")
+         buttons.append([btn(f"#{o['id']} {o['status']}", f"admin:order:{o['id']}")])
+     buttons.append([btn("🔙 پنل ادمین","admin:home")])
+     return edit_message(chat_id,message_id,"\n".join(lines),kb(buttons))
+@@ -4517,22 +4641,43 @@
+         return edit_message(chat_id,message_id,render_order_admin(o),admin_order_detail_menu(order_id))
+     if data.startswith("admin:order_status:"):
+         parts=data.split(":"); order_id=int(parts[2]); status=parts[3]
+-        conn=db(); conn.execute("UPDATE orders SET status=?, updated_at=? WHERE id=?", (status,now(),order_id)); conn.commit(); conn.close()
++        conn=db()
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            ok=set_order_status(conn,order_id,status,"admin",tg_id,"تغییر وضعیت توسط ادمین")
++            if not ok:
++                conn.rollback(); return edit_message(chat_id,message_id,"سفارش پیدا نشد.",admin_back())
++            conn.commit()
++        finally:
++            conn.close()
+         log_admin(tg_id,"order_status",f"{order_id}={status}")
+         return show_orders(chat_id,message_id)
+     if data.startswith("admin:order_refund:"):
+         order_id=int(data.split(":")[2])
+         conn=db()
+-        o=conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+-        if not o:
+-            conn.close(); return edit_message(chat_id,message_id,"سفارش پیدا نشد.",admin_back())
+-        if "REFUNDED" in (o["note"] or ""):
+-            conn.close(); return edit_message(chat_id,message_id,"این سفارش قبلاً بازگشت وجه شده است.",admin_back())
+-        conn.execute("UPDATE users SET balance=balance+? WHERE tg_id=?", (o["amount"],o["user_id"]))
+-        conn.execute("UPDATE orders SET status='refunded', note=note||? , updated_at=? WHERE id=?", ("\nREFUNDED",now(),order_id))
+-        add_wallet_tx(conn,o["user_id"],o["amount"],"refund","order",order_id,"بازگشت وجه سفارش")
+-        conn.commit(); conn.close(); log_admin(tg_id,"order_refund",str(order_id))
+-        try: send_message(o["user_id"], f"🔄 مبلغ سفارش <code>{o['order_code']}</code> به کیف پول شما برگشت داده شد.")
++        try:
++            conn.execute("BEGIN IMMEDIATE")
++            o=conn.execute("SELECT * FROM orders WHERE id=?",(order_id,)).fetchone()
++            if not o:
++                conn.rollback(); return edit_message(chat_id,message_id,"سفارش پیدا نشد.",admin_back())
++            exists=conn.execute("SELECT id FROM order_refunds WHERE order_id=?",(order_id,)).fetchone()
++            if exists or o["status"]=="refunded":
++                conn.rollback(); return edit_message(chat_id,message_id,"این سفارش قبلاً بازگشت وجه شده است.",admin_back())
++            refund_amount=int(o["final_amount"] or o["amount"] or 0)
++            conn.execute("UPDATE users SET balance=balance+? WHERE tg_id=?",(refund_amount,o["user_id"]))
++            add_wallet_tx(conn,o["user_id"],refund_amount,"refund","order",order_id,"بازگشت وجه سفارش")
++            tx_id=conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
++            conn.execute("INSERT INTO order_refunds(order_id,user_id,amount,wallet_tx_id,admin_id,reason,created_at) VALUES(?,?,?,?,?,?,?)",
++                         (order_id,o["user_id"],refund_amount,tx_id,tg_id,"بازگشت وجه توسط ادمین",now()))
++            conn.execute("UPDATE orders SET refund_amount=?, refund_tx_id=? WHERE id=?",(refund_amount,tx_id,order_id))
++            set_order_status(conn,order_id,"refunded","admin",tg_id,"بازگشت وجه توسط ادمین")
++            conn.commit()
++        except sqlite3.IntegrityError:
++            conn.rollback(); return edit_message(chat_id,message_id,"این سفارش قبلاً بازگشت وجه شده است.",admin_back())
++        finally:
++            conn.close()
++        log_admin(tg_id,"order_refund",str(order_id))
++        try: send_message(o["user_id"],f"🔄 مبلغ {money(refund_amount)} تومان برای سفارش <code>{o['order_code']}</code> به کیف پول شما برگشت داده شد.")
+         except Exception: pass
+         return show_orders(chat_id,message_id)
+     for prefix,state_name,prompt in [
