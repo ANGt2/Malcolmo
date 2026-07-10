@@ -418,6 +418,48 @@ def init_db():
         finished_at TEXT DEFAULT ''
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS api_providers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        profile_id TEXT DEFAULT '',
+        base_url TEXT DEFAULT '',
+        api_key TEXT DEFAULT '',
+        auth_header TEXT DEFAULT 'Authorization',
+        auth_prefix TEXT DEFAULT '',
+        symbols_endpoint TEXT DEFAULT '',
+        symbols_method TEXT DEFAULT 'GET',
+        query_json TEXT DEFAULT '{}',
+        body_json TEXT DEFAULT '{}',
+        list_path TEXT DEFAULT '',
+        symbol_path TEXT DEFAULT 'symbol',
+        name_path TEXT DEFAULT 'name',
+        price_path TEXT DEFAULT 'price',
+        id_path TEXT DEFAULT 'id',
+        quote_path TEXT DEFAULT 'quote',
+        dict_key_as_symbol INTEGER DEFAULT 0,
+        timeout_seconds INTEGER DEFAULT 20,
+        priority INTEGER DEFAULT 100,
+        role TEXT DEFAULT 'backup',
+        is_active INTEGER DEFAULT 1,
+        last_status TEXT DEFAULT 'never',
+        last_latency_ms INTEGER DEFAULT 0,
+        last_error TEXT DEFAULT '',
+        last_checked_at TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS api_provider_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_id INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        status TEXT DEFAULT '',
+        latency_ms INTEGER DEFAULT 0,
+        message TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(provider_id) REFERENCES api_providers(id)
+    )""")
+
     try:
         c.execute("ALTER TABLE users ADD COLUMN muted_until INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -471,6 +513,11 @@ def init_db():
         "price_api_quote_path": "quote",
         "price_api_dict_key_as_symbol": "off",
         "price_api_profile_id": "",
+        "multi_provider_enabled": "off",
+        "multi_provider_last_selected_id": "0",
+        "multi_provider_failover_enabled": "on",
+        "multi_provider_health_interval": "300",
+        "multi_provider_last_health_at": "",
         "price_api_last_sync_status": "never",
         "price_api_last_sync_at": "",
         "price_api_last_sync_message": "",
@@ -516,6 +563,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_products_api_symbol ON products(api_symbol_id)",
         "CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time ON api_price_history(symbol_id,recorded_at)",
         "CREATE INDEX IF NOT EXISTS idx_sync_logs_started ON api_sync_logs(started_at)",
+        "CREATE INDEX IF NOT EXISTS idx_api_providers_priority ON api_providers(is_active,priority)",
+        "CREATE INDEX IF NOT EXISTS idx_api_provider_events_provider ON api_provider_events(provider_id,created_at)",
     ]
     for q in indexes:
         c.execute(q)
@@ -794,6 +843,352 @@ def admin_payment_detail_menu(pay_id):
 
 
 
+
+# -------------------- Multi-provider API Manager --------------------
+
+def provider_row_to_config(row):
+    return {
+        "price_api_name": row["name"],
+        "price_api_profile_id": row["profile_id"] or "",
+        "price_api_base_url": row["base_url"] or "",
+        "price_api_key": row["api_key"] or "",
+        "price_api_auth_header": row["auth_header"] or "Authorization",
+        "price_api_auth_prefix": row["auth_prefix"] or "",
+        "price_api_symbols_endpoint": row["symbols_endpoint"] or "",
+        "price_api_symbols_method": row["symbols_method"] or "GET",
+        "price_api_query_json": row["query_json"] or "{}",
+        "price_api_body_json": row["body_json"] or "{}",
+        "price_api_list_path": row["list_path"] or "",
+        "price_api_symbol_path": row["symbol_path"] or "symbol",
+        "price_api_name_path": row["name_path"] or "name",
+        "price_api_price_path": row["price_path"] or "price",
+        "price_api_id_path": row["id_path"] or "id",
+        "price_api_quote_path": row["quote_path"] or "quote",
+        "price_api_dict_key_as_symbol": "on" if row["dict_key_as_symbol"] else "off",
+        "price_api_timeout": str(row["timeout_seconds"] or 20),
+    }
+
+def load_provider_into_runtime(row):
+    for key, value in provider_row_to_config(row).items():
+        set_setting(key, str(value))
+    set_setting("price_api_enabled", "on" if row["is_active"] else "off")
+    set_setting("multi_provider_last_selected_id", str(row["id"]))
+
+def save_current_api_as_provider(name=None, role="backup", priority=100):
+    name = (name or get_setting("price_api_name","") or "Provider").strip()
+    conn = db()
+    conn.execute("""INSERT INTO api_providers(
+                    name,profile_id,base_url,api_key,auth_header,auth_prefix,
+                    symbols_endpoint,symbols_method,query_json,body_json,list_path,
+                    symbol_path,name_path,price_path,id_path,quote_path,
+                    dict_key_as_symbol,timeout_seconds,priority,role,is_active,
+                    created_at,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (
+                     name,
+                     get_setting("price_api_profile_id",""),
+                     get_setting("price_api_base_url",""),
+                     get_setting("price_api_key",""),
+                     get_setting("price_api_auth_header","Authorization"),
+                     get_setting("price_api_auth_prefix",""),
+                     get_setting("price_api_symbols_endpoint",""),
+                     get_setting("price_api_symbols_method","GET"),
+                     get_setting("price_api_query_json","{}"),
+                     get_setting("price_api_body_json","{}"),
+                     get_setting("price_api_list_path",""),
+                     get_setting("price_api_symbol_path","symbol"),
+                     get_setting("price_api_name_path","name"),
+                     get_setting("price_api_price_path","price"),
+                     get_setting("price_api_id_path","id"),
+                     get_setting("price_api_quote_path","quote"),
+                     1 if get_setting("price_api_dict_key_as_symbol","off")=="on" else 0,
+                     max(3,min(60,safe_int(get_setting("price_api_timeout","20"),20))),
+                     int(priority),
+                     role,
+                     1,
+                     now(),
+                     now(),
+                 ))
+    provider_id = conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+    conn.commit(); conn.close()
+    return provider_id
+
+def provider_request_json(row):
+    config = provider_row_to_config(row)
+    base = str(config["price_api_base_url"]).rstrip("/")
+    endpoint = str(config["price_api_symbols_endpoint"] or "")
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        url = endpoint
+    else:
+        url = f"{base}/{endpoint.lstrip('/')}"
+    try:
+        query = json.loads(config["price_api_query_json"] or "{}")
+        if not isinstance(query, dict):
+            query = {}
+    except Exception:
+        query = {}
+    if query:
+        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query, doseq=True)
+
+    headers = {"Accept":"application/json","User-Agent":f"{APP_NAME}/{APP_VERSION}"}
+    key = config["price_api_key"]
+    if key:
+        header_name = config["price_api_auth_header"] or "Authorization"
+        prefix = config["price_api_auth_prefix"] or ""
+        headers[header_name] = f"{prefix} {key}".strip() if prefix else key
+
+    method = str(config["price_api_symbols_method"] or "GET").upper()
+    data = None
+    if method == "POST":
+        try:
+            body = json.loads(config["price_api_body_json"] or "{}")
+        except Exception:
+            body = {}
+        data = json.dumps(body,ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    timeout = max(3,min(60,int(row["timeout_seconds"] or 20)))
+    req = urllib.request.Request(url,data=data,headers=headers,method=method)
+    started = time.time()
+    with urllib.request.urlopen(req,timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8",errors="replace")
+        payload = json.loads(raw)
+    latency_ms = int((time.time()-started)*1000)
+    return payload, latency_ms
+
+def map_provider_symbols(row, payload):
+    config = provider_row_to_config(row)
+    list_path = config["price_api_list_path"]
+    rows = json_path_get(payload,list_path,None)
+    if rows is None:
+        raise RuntimeError("مسیر لیست پیدا نشد.")
+    if isinstance(rows,dict):
+        if config["price_api_dict_key_as_symbol"]=="on":
+            converted=[]
+            for k,v in rows.items():
+                if k in ("status","code","message","msg","time","timestamp"):
+                    continue
+                if isinstance(v,dict):
+                    item=dict(v)
+                    item["__key__"]=k
+                    converted.append(item)
+            rows=converted
+        else:
+            rows=list(rows.values())
+    if not isinstance(rows,list):
+        raise RuntimeError("خروجی لیست معتبر نیست.")
+
+    mapped=[]
+    for item in rows:
+        symbol=json_path_get(item,config["price_api_symbol_path"],"")
+        if symbol is None or str(symbol).strip()=="":
+            continue
+        mapped.append({
+            "symbol":str(symbol).strip().upper(),
+            "display_name":str(json_path_get(item,config["price_api_name_path"],"") or ""),
+            "external_id":str(json_path_get(item,config["price_api_id_path"],"") or ""),
+            "quote_currency":str(json_path_get(item,config["price_api_quote_path"],"") or ""),
+            "price":normalize_price_value(json_path_get(item,config["price_api_price_path"],0)),
+            "raw_json":json.dumps(item,ensure_ascii=False,separators=(",",":"))[:12000],
+        })
+    return mapped
+
+def provider_event(provider_id,event_type,status="",latency_ms=0,message=""):
+    conn=db()
+    conn.execute("""INSERT INTO api_provider_events(
+                    provider_id,event_type,status,latency_ms,message,created_at
+                  ) VALUES(?,?,?,?,?,?)""",
+                 (provider_id,event_type,status,int(latency_ms or 0),str(message or "")[:3000],now()))
+    conn.commit(); conn.close()
+
+def check_provider(provider_id):
+    conn=db()
+    row=conn.execute("SELECT * FROM api_providers WHERE id=?",(provider_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False,0,"Provider not found"
+    try:
+        payload,latency=provider_request_json(row)
+        mapped=map_provider_symbols(row,payload)
+        ok=len(mapped)>0
+        msg=f"symbols={len(mapped)}"
+        status="ok" if ok else "empty"
+    except Exception as e:
+        ok=False
+        latency=0
+        msg=repr(e)
+        status="failed"
+
+    conn=db()
+    conn.execute("""UPDATE api_providers
+                    SET last_status=?,last_latency_ms=?,last_error=?,
+                        last_checked_at=?,updated_at=?
+                    WHERE id=?""",
+                 (status,latency,"" if ok else msg,now(),now(),provider_id))
+    conn.commit(); conn.close()
+    provider_event(provider_id,"health_check",status,latency,msg)
+    return ok,latency,msg
+
+def sync_from_provider(provider_id,trigger="manual"):
+    conn=db()
+    row=conn.execute("SELECT * FROM api_providers WHERE id=? AND is_active=1",(provider_id,)).fetchone()
+    conn.close()
+    if not row:
+        return False,"Provider unavailable"
+
+    try:
+        payload,latency=provider_request_json(row)
+        mapped=map_provider_symbols(row,payload)
+        provider_name=row["name"]
+        conn=db()
+        inserted=updated=changed=0
+        for item in mapped:
+            old=conn.execute("""SELECT * FROM api_symbols
+                                WHERE provider_name=? AND symbol=?""",
+                             (provider_name,item["symbol"])).fetchone()
+            old_price=float(old["price"] or 0) if old else None
+            conn.execute("""INSERT INTO api_symbols(
+                              provider_name,external_id,symbol,display_name,price,
+                              quote_currency,raw_json,is_active,updated_at,created_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(provider_name,symbol) DO UPDATE SET
+                              external_id=excluded.external_id,
+                              display_name=excluded.display_name,
+                              price=excluded.price,
+                              quote_currency=excluded.quote_currency,
+                              raw_json=excluded.raw_json,
+                              updated_at=excluded.updated_at""",
+                         (provider_name,item["external_id"],item["symbol"],item["display_name"],
+                          item["price"],item["quote_currency"],item["raw_json"],1,now(),now()))
+            current=conn.execute("""SELECT id FROM api_symbols
+                                    WHERE provider_name=? AND symbol=?""",
+                                 (provider_name,item["symbol"])).fetchone()
+            if old:
+                updated+=1
+            else:
+                inserted+=1
+            if old_price is None or old_price!=float(item["price"]):
+                changed+=1
+                record_symbol_price_history(conn,current["id"],item["price"])
+        conn.commit(); conn.close()
+
+        conn=db()
+        conn.execute("""UPDATE api_providers
+                        SET last_status='ok',last_latency_ms=?,last_error='',
+                            last_checked_at=?,updated_at=?
+                        WHERE id=?""",(latency,now(),now(),provider_id))
+        conn.commit(); conn.close()
+        msg=f"provider={provider_name} | symbols={len(mapped)} | new={inserted} | updated={updated} | changed={changed} | latency={latency}ms"
+        provider_event(provider_id,"sync","ok",latency,msg)
+        set_setting("multi_provider_last_selected_id",str(provider_id))
+        load_provider_into_runtime(row)
+        return True,msg
+    except Exception as e:
+        msg=repr(e)
+        conn=db()
+        conn.execute("""UPDATE api_providers
+                        SET last_status='failed',last_latency_ms=0,last_error=?,
+                            last_checked_at=?,updated_at=?
+                        WHERE id=?""",(msg,now(),now(),provider_id))
+        conn.commit(); conn.close()
+        provider_event(provider_id,"sync","failed",0,msg)
+        return False,msg
+
+def choose_provider():
+    conn=db()
+    rows=conn.execute("""SELECT * FROM api_providers
+                         WHERE is_active=1
+                         ORDER BY CASE WHEN role='primary' THEN 0 ELSE 1 END,
+                                  priority ASC,id ASC""").fetchall()
+    conn.close()
+    if not rows:
+        return None
+    for row in rows:
+        ok,latency,msg=check_provider(row["id"])
+        if ok:
+            return row
+        if get_setting("multi_provider_failover_enabled","on")!="on":
+            break
+    return None
+
+def run_multi_provider_sync(trigger="manual"):
+    row=choose_provider()
+    if not row:
+        return False,"هیچ Provider سالمی پیدا نشد."
+    return sync_from_provider(row["id"],trigger)
+
+def multi_provider_admin_text():
+    conn=db()
+    rows=conn.execute("""SELECT * FROM api_providers
+                         ORDER BY CASE WHEN role='primary' THEN 0 ELSE 1 END,
+                                  priority ASC,id ASC""").fetchall()
+    conn.close()
+    lines=[
+        "🌐 <b>مدیریت چند API</b>\n",
+        f"سیستم چند API: <b>{'فعال ✅' if get_setting('multi_provider_enabled','off')=='on' else 'غیرفعال ❌'}</b>",
+        f"Failover خودکار: <b>{'فعال ✅' if get_setting('multi_provider_failover_enabled','on')=='on' else 'غیرفعال ❌'}</b>",
+        f"تعداد Providerها: <b>{len(rows)}</b>\n",
+    ]
+    for r in rows:
+        role="⭐ اصلی" if r["role"]=="primary" else "🛟 پشتیبان"
+        active="✅" if r["is_active"] else "❌"
+        lines.append(f"{active} #{r['id']} <b>{html_escape(r['name'])}</b> | {role} | priority:{r['priority']} | {r['last_status']} | {r['last_latency_ms']}ms")
+    return "\n".join(lines)
+
+def multi_provider_admin_menu():
+    conn=db()
+    rows=conn.execute("""SELECT * FROM api_providers
+                         ORDER BY CASE WHEN role='primary' THEN 0 ELSE 1 END,
+                                  priority ASC,id ASC LIMIT 50""").fetchall()
+    conn.close()
+    buttons=[
+        [btn("🔁 فعال/غیرفعال سیستم","admin:providers_toggle")],
+        [btn("🔄 Failover روشن/خاموش","admin:providers_failover_toggle")],
+        [btn("➕ ذخیره API فعلی به‌عنوان Provider","admin:provider_add_current")],
+        [btn("🧪 تست همه Providerها","admin:providers_test_all")],
+        [btn("🚀 Sync با بهترین Provider","admin:providers_sync_best")],
+    ]
+    for r in rows:
+        active="✅" if r["is_active"] else "❌"
+        role="⭐" if r["role"]=="primary" else "🛟"
+        buttons.append([btn(f"{active}{role} #{r['id']} {r['name']}",f"admin:provider:{r['id']}")])
+    buttons.append([btn("🔙 مدیریت API","admin:price_api")])
+    return kb(buttons)
+
+def provider_detail_text(row):
+    return f"""🌐 <b>Provider #{row['id']}</b>
+
+نام: <b>{html_escape(row['name'])}</b>
+Profile: <code>{html_escape(row['profile_id'] or '-')}</code>
+Role: <b>{html_escape(row['role'])}</b>
+Priority: <code>{row['priority']}</code>
+Active: <b>{'yes' if row['is_active'] else 'no'}</b>
+
+Base URL:
+<code>{html_escape(row['base_url'] or '-')}</code>
+
+Endpoint:
+<code>{html_escape(row['symbols_endpoint'] or '-')}</code>
+
+Status: <b>{html_escape(row['last_status'])}</b>
+Latency: <code>{row['last_latency_ms']} ms</code>
+Last Check: {html_escape(row['last_checked_at'] or '-')}
+Last Error:
+<code>{html_escape(row['last_error'] or '-')}</code>
+"""
+
+def provider_detail_menu(provider_id):
+    return kb([
+        [btn("⭐ انتخاب به‌عنوان اصلی",f"admin:provider_primary:{provider_id}")],
+        [btn("🔁 فعال/غیرفعال",f"admin:provider_toggle:{provider_id}")],
+        [btn("🔢 تغییر اولویت",f"admin:provider_priority:{provider_id}")],
+        [btn("🧪 تست اتصال",f"admin:provider_test:{provider_id}")],
+        [btn("🔄 Sync از این Provider",f"admin:provider_sync:{provider_id}")],
+        [btn("📥 بارگذاری در تنظیمات فعلی",f"admin:provider_load:{provider_id}")],
+        [btn("🗑 حذف Provider",f"admin:provider_delete_confirm:{provider_id}")],
+        [btn("🔙 چند API","admin:providers")]
+    ])
+
 # -------------------- Automatic Price Engine --------------------
 
 PRICE_ENGINE_NEXT_RUN = 0
@@ -847,6 +1242,8 @@ def recalculate_all_online_products(conn=None):
     return updated, blocked
 
 def run_price_engine_sync(trigger="manual"):
+    if get_setting("multi_provider_enabled","off")=="on":
+        return run_multi_provider_sync(trigger)
     started = now()
     log_conn = db()
     log_conn.execute("""INSERT INTO api_sync_logs(status,message,symbols_count,started_at,finished_at)
@@ -1959,6 +2356,7 @@ def price_api_admin_menu():
         [btn("🧪 Test Endpoint", "admin:price_api_set_test_endpoint"), btn("⏱ Timeout", "admin:price_api_set_timeout")],
         [btn("🔍 تست اتصال", "admin:price_api_test")],
         [btn("🧰 پروفایل‌های آماده API", "admin:api_profiles")],
+        [btn("🌐 مدیریت چند API", "admin:providers")],
         [btn("🧩 تنظیم نمادها و قیمت‌ها", "admin:api_mapper")],
         [btn("⚙️ موتور قیمت خودکار", "admin:price_engine")],
         [btn("💱 لیست نمادها", "admin:api_symbols:0")],
@@ -2952,6 +3350,101 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
+    if data=="admin:providers":
+        return edit_message(chat_id,message_id,multi_provider_admin_text(),multi_provider_admin_menu())
+
+    if data=="admin:providers_toggle":
+        cur=get_setting("multi_provider_enabled","off")
+        set_setting("multi_provider_enabled","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,multi_provider_admin_text(),multi_provider_admin_menu())
+
+    if data=="admin:providers_failover_toggle":
+        cur=get_setting("multi_provider_failover_enabled","on")
+        set_setting("multi_provider_failover_enabled","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,multi_provider_admin_text(),multi_provider_admin_menu())
+
+    if data=="admin:provider_add_current":
+        set_state(tg_id,"provider_add_name")
+        return edit_message(chat_id,message_id,"نام Provider جدید را ارسال کن:",admin_back())
+
+    if data=="admin:providers_test_all":
+        conn=db(); rows=conn.execute("SELECT id,name FROM api_providers ORDER BY priority,id").fetchall(); conn.close()
+        lines=["🧪 <b>نتیجه تست Providerها</b>\n"]
+        for r in rows:
+            ok,latency,msg=check_provider(r["id"])
+            lines.append(f"{'✅' if ok else '❌'} #{r['id']} {html_escape(r['name'])} | {latency}ms | {html_escape(msg)}")
+        return edit_message(chat_id,message_id,"\n".join(lines),multi_provider_admin_menu())
+
+    if data=="admin:providers_sync_best":
+        ok,msg=run_multi_provider_sync("manual")
+        return edit_message(chat_id,message_id,f"{'✅' if ok else '❌'} {html_escape(msg)}",multi_provider_admin_menu())
+
+    if data.startswith("admin:provider:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        conn=db(); row=conn.execute("SELECT * FROM api_providers WHERE id=?",(provider_id,)).fetchone(); conn.close()
+        if not row:
+            return edit_message(chat_id,message_id,"Provider پیدا نشد.",multi_provider_admin_menu())
+        return edit_message(chat_id,message_id,provider_detail_text(row),provider_detail_menu(provider_id))
+
+    if data.startswith("admin:provider_primary:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        conn.execute("UPDATE api_providers SET role='backup'")
+        conn.execute("UPDATE api_providers SET role='primary',priority=0 WHERE id=?",(provider_id,))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ Provider اصلی تغییر کرد.",multi_provider_admin_menu())
+
+    if data.startswith("admin:provider_toggle:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        conn.execute("""UPDATE api_providers
+                        SET is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END,
+                            updated_at=?
+                        WHERE id=?""",(now(),provider_id))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ وضعیت Provider تغییر کرد.",multi_provider_admin_menu())
+
+    if data.startswith("admin:provider_priority:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        set_state(tg_id,"provider_priority",{"provider_id":provider_id})
+        return edit_message(chat_id,message_id,"اولویت عددی را ارسال کن؛ عدد کمتر یعنی اولویت بالاتر:",admin_back())
+
+    if data.startswith("admin:provider_test:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        ok,latency,msg=check_provider(provider_id)
+        return edit_message(chat_id,message_id,
+            f"{'✅' if ok else '❌'} نتیجه تست\nLatency: {latency} ms\n<code>{html_escape(msg)[:2500]}</code>",
+            kb([[btn("🔙 Provider",f"admin:provider:{provider_id}")]]))
+
+    if data.startswith("admin:provider_sync:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        ok,msg=sync_from_provider(provider_id,"manual")
+        return edit_message(chat_id,message_id,f"{'✅' if ok else '❌'} {html_escape(msg)}",
+                            kb([[btn("🔙 Provider",f"admin:provider:{provider_id}")]]))
+
+    if data.startswith("admin:provider_load:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        conn=db(); row=conn.execute("SELECT * FROM api_providers WHERE id=?",(provider_id,)).fetchone(); conn.close()
+        if row:
+            load_provider_into_runtime(row)
+        return edit_message(chat_id,message_id,"✅ Provider در تنظیمات فعلی بارگذاری شد.",
+                            kb([[btn("⚙️ مدیریت API","admin:price_api")],[btn("🔙 چند API","admin:providers")]]))
+
+    if data.startswith("admin:provider_delete_confirm:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        return edit_message(chat_id,message_id,"آیا Provider حذف شود؟",kb([
+            [btn("✅ بله حذف کن",f"admin:provider_delete:{provider_id}")],
+            [btn("❌ انصراف",f"admin:provider:{provider_id}")]
+        ]))
+
+    if data.startswith("admin:provider_delete:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        conn.execute("DELETE FROM api_provider_events WHERE provider_id=?",(provider_id,))
+        conn.execute("DELETE FROM api_providers WHERE id=?",(provider_id,))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ Provider حذف شد.",multi_provider_admin_menu())
+
     if data=="admin:api_profiles":
         return edit_message(
             chat_id,message_id,
@@ -3914,6 +4407,18 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="provider_add_name":
+            provider_id=save_current_api_as_provider(text.strip(),role="backup",priority=100)
+            send_message(chat_id,f"✅ Provider با ID {provider_id} ساخته شد.",multi_provider_admin_menu()); return True
+
+        if name=="provider_priority":
+            provider_id=data["provider_id"]
+            value=max(0,min(9999,safe_int(only_digits(text),100)))
+            conn=db()
+            conn.execute("UPDATE api_providers SET priority=?,updated_at=? WHERE id=?",(value,now(),provider_id))
+            conn.commit(); conn.close()
+            send_message(chat_id,f"✅ اولویت روی {value} تنظیم شد.",multi_provider_admin_menu()); return True
+
         if name=="engine_interval":
             value=max(60,min(86400,safe_int(only_digits(text),300)))
             set_setting("price_engine_interval_seconds",str(value))
@@ -4273,6 +4778,9 @@ def handle_message(message):
     if text=="/apiprofiles":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,"🧰 پروفایل‌های آماده API",api_profiles_main_menu())
+    if text=="/providers":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,multi_provider_admin_text(),multi_provider_admin_menu())
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
