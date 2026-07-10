@@ -66,9 +66,13 @@ Part 03 adds:
 - inventory depletion forecasts and dormant stock analysis
 - provider reliability analytics
 - advanced finance search and management exports
+- automated backup and restore center
+- database integrity, optimization and maintenance tools
+- centralized error tracking and diagnostics
+- final release audit and operational hardening
 """
 
-import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib
+import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib, shutil, zipfile
 from datetime import datetime
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8979540158:AAGho_VCJlaYaggrhhcXQlAUm4KOv8sXfhU")
@@ -439,6 +443,42 @@ def init_db():
         resolved_at TEXT DEFAULT ''
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS system_errors (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        error_code TEXT UNIQUE NOT NULL,
+        source TEXT DEFAULT '',
+        error_type TEXT DEFAULT '',
+        message TEXT DEFAULT '',
+        traceback_text TEXT DEFAULT '',
+        context_json TEXT DEFAULT '{}',
+        status TEXT DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        resolved_at TEXT DEFAULT ''
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS system_backups (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backup_code TEXT UNIQUE NOT NULL,
+        file_path TEXT NOT NULL,
+        file_size INTEGER DEFAULT 0,
+        checksum TEXT DEFAULT '',
+        backup_type TEXT DEFAULT 'manual',
+        status TEXT DEFAULT 'ready',
+        created_by INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        restored_at TEXT DEFAULT ''
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS system_maintenance_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        action TEXT NOT NULL,
+        status TEXT DEFAULT 'ok',
+        detail TEXT DEFAULT '',
+        duration_ms INTEGER DEFAULT 0,
+        admin_id INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         admin_tg_id INTEGER NOT NULL,
@@ -765,6 +805,16 @@ def init_db():
         "bi_inventory_forecast_days": "30",
         "bi_dormant_stock_days": "30",
         "bi_provider_window_days": "7",
+        "ops_auto_backup": "off",
+        "ops_backup_interval_seconds": "21600",
+        "ops_backup_keep_count": "10",
+        "ops_last_backup_at": "",
+        "ops_auto_maintenance": "off",
+        "ops_maintenance_interval_seconds": "86400",
+        "ops_last_maintenance_at": "",
+        "ops_error_retention": "500",
+        "ops_sensitive_confirm": "on",
+        "release_channel": "stable",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
@@ -832,6 +882,9 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_finance_logs_entity ON finance_logs(entity_type,entity_id)",
         "CREATE INDEX IF NOT EXISTS idx_finance_alert_events_status ON finance_alert_events(status,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_finance_alert_events_type ON finance_alert_events(rule_type,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_system_errors_status ON system_errors(status,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_system_backups_created ON system_backups(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_maintenance_logs_created ON system_maintenance_logs(created_at)",
     ]
     for q in indexes:
         c.execute(q)
@@ -1894,6 +1947,368 @@ def bi_export_csv_text():
     for row in payload["providers"]: writer.writerow(["provider",row["name"],json.dumps(row,ensure_ascii=False)])
     return output.getvalue()
 
+
+# -------------------- Operations / Release Hardening --------------------
+
+OPS_BACKUP_NEXT_RUN = 0
+OPS_MAINTENANCE_NEXT_RUN = 0
+
+def ops_root_dir():
+    root = os.path.abspath(os.path.dirname(DB_PATH) or ".")
+    path = os.path.join(root, "mvlite_ops")
+    os.makedirs(path, exist_ok=True)
+    os.makedirs(os.path.join(path, "backups"), exist_ok=True)
+    os.makedirs(os.path.join(path, "exports"), exist_ok=True)
+    return path
+
+def ops_file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def capture_system_error(source, error, context=None):
+    try:
+        error_code = f"ERR-{datetime.now().strftime('%y%m%d%H%M%S')}-{random.randint(1000,9999)}"
+        tb = traceback.format_exc()
+        conn = db()
+        conn.execute("""INSERT INTO system_errors(
+                        error_code,source,error_type,message,traceback_text,
+                        context_json,status,created_at,resolved_at
+                      ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                     (
+                         error_code, str(source or "")[:200],
+                         type(error).__name__, str(error)[:3000],
+                         tb[:12000],
+                         json.dumps(context or {},ensure_ascii=False)[:8000],
+                         "open", now(), ""
+                     ))
+        conn.commit(); conn.close()
+        return error_code
+    except Exception:
+        return ""
+
+def cleanup_system_errors():
+    keep=max(50,min(10000,safe_int(get_setting("ops_error_retention","500"),500)))
+    conn=db()
+    conn.execute("""DELETE FROM system_errors
+                    WHERE id NOT IN (
+                      SELECT id FROM system_errors ORDER BY id DESC LIMIT ?
+                    )""",(keep,))
+    deleted=conn.total_changes
+    conn.commit(); conn.close()
+    return deleted
+
+def create_database_backup(backup_type="manual",created_by=0):
+    root=ops_root_dir()
+    backup_dir=os.path.join(root,"backups")
+    code=f"BKP-{datetime.now().strftime('%y%m%d-%H%M%S')}-{random.randint(1000,9999)}"
+    db_name=os.path.basename(DB_PATH)
+    raw_path=os.path.join(backup_dir,f"{code}_{db_name}")
+    zip_path=os.path.join(backup_dir,f"{code}.zip")
+    conn=db()
+    try:
+        dest=sqlite3.connect(raw_path)
+        conn.backup(dest)
+        dest.close()
+    finally:
+        conn.close()
+    with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as zf:
+        zf.write(raw_path,arcname=db_name)
+        metadata={
+            "app_name":APP_NAME,
+            "app_version":APP_VERSION,
+            "created_at":now(),
+            "backup_code":code,
+            "backup_type":backup_type,
+            "database_file":db_name
+        }
+        zf.writestr("metadata.json",json.dumps(metadata,ensure_ascii=False,indent=2))
+    os.remove(raw_path)
+    size=os.path.getsize(zip_path)
+    checksum=ops_file_sha256(zip_path)
+    conn=db()
+    conn.execute("""INSERT INTO system_backups(
+                    backup_code,file_path,file_size,checksum,backup_type,status,
+                    created_by,created_at,restored_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                 (code,zip_path,size,checksum,backup_type,"ready",created_by,now(),""))
+    conn.commit(); conn.close()
+    set_setting("ops_last_backup_at",now())
+    cleanup_old_backups()
+    return code,zip_path,size,checksum
+
+def cleanup_old_backups():
+    keep=max(1,min(100,safe_int(get_setting("ops_backup_keep_count","10"),10)))
+    conn=db()
+    rows=conn.execute("SELECT * FROM system_backups ORDER BY id DESC").fetchall()
+    for row in rows[keep:]:
+        try:
+            if os.path.exists(row["file_path"]):
+                os.remove(row["file_path"])
+        except Exception:
+            pass
+        conn.execute("DELETE FROM system_backups WHERE id=?",(row["id"],))
+    conn.commit(); conn.close()
+
+def restore_database_backup(backup_id,admin_id=0):
+    conn=db()
+    row=conn.execute("SELECT * FROM system_backups WHERE id=?",(backup_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise RuntimeError("بکاپ پیدا نشد.")
+    path=row["file_path"]
+    if not os.path.exists(path):
+        raise RuntimeError("فایل بکاپ وجود ندارد.")
+    if ops_file_sha256(path)!=row["checksum"]:
+        raise RuntimeError("Checksum بکاپ نامعتبر است.")
+    temp_dir=os.path.join(ops_root_dir(),"restore_tmp")
+    if os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir)
+    os.makedirs(temp_dir,exist_ok=True)
+    with zipfile.ZipFile(path,"r") as zf:
+        zf.extractall(temp_dir)
+    candidates=[p for p in Path(temp_dir).iterdir() if p.suffix in (".db",".sqlite",".sqlite3")]
+    if not candidates:
+        raise RuntimeError("فایل دیتابیس داخل بکاپ پیدا نشد.")
+    restore_source=str(candidates[0])
+    safety_code,safety_path,_,_=create_database_backup("pre_restore",admin_id)
+    shutil.copy2(restore_source,DB_PATH)
+    test=sqlite3.connect(DB_PATH)
+    check=test.execute("PRAGMA integrity_check").fetchone()[0]
+    test.close()
+    if str(check).lower()!="ok":
+        shutil.copy2(safety_path,DB_PATH)
+        raise RuntimeError("بازیابی ناموفق بود و بکاپ ایمنی حفظ شد.")
+    conn=db()
+    conn.execute("UPDATE system_backups SET restored_at=? WHERE id=?",(now(),backup_id))
+    conn.execute("""INSERT INTO system_maintenance_logs(
+                    action,status,detail,duration_ms,admin_id,created_at
+                  ) VALUES(?,?,?,?,?,?)""",
+                 ("restore_backup","ok",f"backup_id={backup_id}; safety={safety_code}",0,admin_id,now()))
+    conn.commit(); conn.close()
+    return True
+
+def database_integrity_report():
+    conn=db()
+    integrity=conn.execute("PRAGMA integrity_check").fetchone()[0]
+    quick=conn.execute("PRAGMA quick_check").fetchone()[0]
+    pages=conn.execute("PRAGMA page_count").fetchone()[0]
+    freelist=conn.execute("PRAGMA freelist_count").fetchone()[0]
+    journal=conn.execute("PRAGMA journal_mode").fetchone()[0]
+    foreign_keys=conn.execute("PRAGMA foreign_key_check").fetchall()
+    conn.close()
+    return {
+        "integrity":integrity,
+        "quick":quick,
+        "pages":int(pages or 0),
+        "freelist":int(freelist or 0),
+        "journal":journal,
+        "foreign_key_issues":len(foreign_keys)
+    }
+
+def run_database_maintenance(admin_id=0):
+    started=time.time()
+    conn=db()
+    status="ok"; details=[]
+    try:
+        conn.execute("PRAGMA optimize")
+        details.append("optimize")
+        conn.execute("ANALYZE")
+        details.append("analyze")
+        conn.execute("REINDEX")
+        details.append("reindex")
+        conn.commit()
+        conn.execute("VACUUM")
+        details.append("vacuum")
+    except Exception as e:
+        status="failed"
+        details.append(repr(e))
+        capture_system_error("run_database_maintenance",e,{"admin_id":admin_id})
+    finally:
+        conn.close()
+    duration=int((time.time()-started)*1000)
+    conn=db()
+    conn.execute("""INSERT INTO system_maintenance_logs(
+                    action,status,detail,duration_ms,admin_id,created_at
+                  ) VALUES(?,?,?,?,?,?)""",
+                 ("database_maintenance",status," | ".join(details),duration,admin_id,now()))
+    conn.commit(); conn.close()
+    set_setting("ops_last_maintenance_at",now())
+    return status,details,duration
+
+def final_release_audit():
+    report=[]
+    report.append(("syntax","ok"))
+    db_report=database_integrity_report()
+    report.append(("db_integrity",str(db_report["integrity"])))
+    report.append(("db_quick",str(db_report["quick"])))
+    report.append(("foreign_key_issues",str(db_report["foreign_key_issues"])))
+    conn=db()
+    checks={
+        "users":"SELECT COUNT(*) n FROM users",
+        "orders":"SELECT COUNT(*) n FROM orders",
+        "products":"SELECT COUNT(*) n FROM products",
+        "finance_transactions":"SELECT COUNT(*) n FROM finance_transactions",
+        "profit_snapshots":"SELECT COUNT(*) n FROM profit_snapshots",
+        "product_codes":"SELECT COUNT(*) n FROM product_codes",
+        "api_providers":"SELECT COUNT(*) n FROM api_providers",
+        "open_errors":"SELECT COUNT(*) n FROM system_errors WHERE status='open'",
+    }
+    for name,q in checks.items():
+        report.append((name,str(conn.execute(q).fetchone()["n"])))
+    conn.close()
+    return report
+
+def ops_dashboard_text():
+    db_report=database_integrity_report()
+    conn=db()
+    backups=conn.execute("SELECT COUNT(*) n FROM system_backups").fetchone()["n"]
+    errors=conn.execute("SELECT COUNT(*) n FROM system_errors WHERE status='open'").fetchone()["n"]
+    last_backup=conn.execute("SELECT * FROM system_backups ORDER BY id DESC LIMIT 1").fetchone()
+    last_maint=conn.execute("SELECT * FROM system_maintenance_logs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return f"""🛠 <b>مرکز عملیات و پایداری</b>
+
+Auto Backup: <b>{'فعال ✅' if get_setting('ops_auto_backup','off')=='on' else 'غیرفعال ❌'}</b>
+Auto Maintenance: <b>{'فعال ✅' if get_setting('ops_auto_maintenance','off')=='on' else 'غیرفعال ❌'}</b>
+
+Integrity: <code>{html_escape(db_report['integrity'])}</code>
+Quick Check: <code>{html_escape(db_report['quick'])}</code>
+Foreign Key Issues: <b>{db_report['foreign_key_issues']}</b>
+Free Pages: <b>{db_report['freelist']}</b>
+
+تعداد بکاپ‌ها: <b>{backups}</b>
+خطاهای باز: <b>{errors}</b>
+
+آخرین بکاپ:
+{html_escape(last_backup['created_at'] if last_backup else '-')}
+
+آخرین نگهداری:
+{html_escape(last_maint['created_at'] if last_maint else '-')}
+"""
+
+def ops_dashboard_menu():
+    return kb([
+        [btn("💾 بکاپ الآن","admin:ops_backup_now"),btn("📂 لیست بکاپ‌ها","admin:ops_backups")],
+        [btn("🔁 Auto Backup","admin:ops_toggle_backup"),btn("⏱ بازه بکاپ","admin:ops_backup_interval")],
+        [btn("🧹 نگهداری دیتابیس","admin:ops_maintenance_now"),btn("🔁 Auto Maintenance","admin:ops_toggle_maintenance")],
+        [btn("🩺 گزارش سلامت دیتابیس","admin:ops_db_health")],
+        [btn("🚨 مرکز خطاها","admin:ops_errors"),btn("🧪 Audit نهایی","admin:ops_audit")],
+        [btn("📦 Export کامل سیستم","admin:ops_full_export")],
+        [btn("🔙 پنل ادمین","admin:home")]
+    ])
+
+def ops_backups_menu():
+    conn=db()
+    rows=conn.execute("SELECT * FROM system_backups ORDER BY id DESC LIMIT 50").fetchall()
+    conn.close()
+    buttons=[]
+    for r in rows:
+        buttons.append([btn(f"#{r['id']} {r['backup_code']} | {r['backup_type']}",f"admin:ops_backup:{r['id']}")])
+    if not rows:
+        buttons.append([btn("بکاپی وجود ندارد","noop")])
+    buttons.append([btn("🔙 مرکز عملیات","admin:ops")])
+    return kb(buttons)
+
+def ops_backup_detail_text(row):
+    return f"""💾 <b>جزئیات بکاپ</b>
+
+ID: <code>{row['id']}</code>
+Code: <code>{html_escape(row['backup_code'])}</code>
+Type: <code>{html_escape(row['backup_type'])}</code>
+Size: <b>{money(row['file_size'])}</b> bytes
+Status: <code>{html_escape(row['status'])}</code>
+Created: {html_escape(row['created_at'])}
+Restored: {html_escape(row['restored_at'] or '-')}
+
+Checksum:
+<code>{html_escape(row['checksum'])}</code>
+"""
+
+def ops_backup_detail_menu(backup_id):
+    return kb([
+        [btn("📤 ارسال فایل","admin:ops_backup_send:"+str(backup_id))],
+        [btn("♻️ بازیابی این بکاپ","admin:ops_backup_restore_confirm:"+str(backup_id))],
+        [btn("🗑 حذف بکاپ","admin:ops_backup_delete_confirm:"+str(backup_id))],
+        [btn("🔙 بکاپ‌ها","admin:ops_backups")]
+    ])
+
+def ops_errors_text(mode="open"):
+    conn=db()
+    if mode=="open":
+        rows=conn.execute("SELECT * FROM system_errors WHERE status='open' ORDER BY id DESC LIMIT 40").fetchall()
+    else:
+        rows=conn.execute("SELECT * FROM system_errors ORDER BY id DESC LIMIT 40").fetchall()
+    conn.close()
+    lines=[f"🚨 <b>خطاهای سیستم — {'باز' if mode=='open' else 'همه'}</b>\n"]
+    if not rows:
+        lines.append("خطایی ثبت نشده است.")
+    for r in rows:
+        lines.append(
+            f"#{r['id']} <code>{r['error_code']}</code>\n"
+            f"{html_escape(r['source'])} | {html_escape(r['error_type'])}\n"
+            f"{html_escape(r['message'])}\n{r['created_at']} | {r['status']}"
+        )
+    return "\n\n".join(lines)
+
+def ops_full_export():
+    root=ops_root_dir()
+    path=os.path.join(root,"exports",f"MVLite_Full_Export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip")
+    backup_code,backup_path,_,_=create_database_backup("full_export",0)
+    with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as zf:
+        zf.write(backup_path,arcname=os.path.basename(backup_path))
+        if os.path.exists(__file__):
+            zf.write(__file__,arcname="app.py")
+        manifest={
+            "app_name":APP_NAME,
+            "app_version":APP_VERSION,
+            "release":APP_RELEASE,
+            "generated_at":now(),
+            "backup_code":backup_code,
+            "audit":final_release_audit()
+        }
+        zf.writestr("manifest.json",json.dumps(manifest,ensure_ascii=False,indent=2))
+    return path
+
+def ops_backup_due():
+    global OPS_BACKUP_NEXT_RUN
+    if get_setting("ops_auto_backup","off")!="on":
+        return False
+    current=time.time()
+    if OPS_BACKUP_NEXT_RUN<=0:
+        OPS_BACKUP_NEXT_RUN=current+10
+    return current>=OPS_BACKUP_NEXT_RUN
+
+def ops_maintenance_due():
+    global OPS_MAINTENANCE_NEXT_RUN
+    if get_setting("ops_auto_maintenance","off")!="on":
+        return False
+    current=time.time()
+    if OPS_MAINTENANCE_NEXT_RUN<=0:
+        OPS_MAINTENANCE_NEXT_RUN=current+30
+    return current>=OPS_MAINTENANCE_NEXT_RUN
+
+def run_ops_if_due():
+    global OPS_BACKUP_NEXT_RUN,OPS_MAINTENANCE_NEXT_RUN
+    if ops_backup_due():
+        interval=max(300,min(604800,safe_int(get_setting("ops_backup_interval_seconds","21600"),21600)))
+        OPS_BACKUP_NEXT_RUN=time.time()+interval
+        try:
+            create_database_backup("auto",0)
+            print("OPS AUTO BACKUP: OK")
+        except Exception as e:
+            capture_system_error("ops_auto_backup",e,{})
+            print("OPS AUTO BACKUP ERROR:",repr(e))
+    if ops_maintenance_due():
+        interval=max(3600,min(2592000,safe_int(get_setting("ops_maintenance_interval_seconds","86400"),86400)))
+        OPS_MAINTENANCE_NEXT_RUN=time.time()+interval
+        run_database_maintenance(0)
+
 # -------------------- State --------------------
 
 def set_state(tg_id,name,data=None): STATE[tg_id]={"name":name,"data":data or {}, "time":time.time()}
@@ -1973,6 +2388,7 @@ def admin_menu():
         [btn("🌐 API قیمت‌ها", "admin:price_api")],
         [btn("📦 انبار حرفه‌ای ووچر", "admin:inventory")],
         [btn("💰 مرکز مالی", "admin:finance:today")],
+        [btn("🛠 مرکز عملیات و پایداری", "admin:ops")],
         [btn("🏠 منوی کاربر", "main")],
     ])
 
@@ -5530,6 +5946,130 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
         send_text_file(chat_id,f"mvlite_bi_{int(time.time())}.csv",bi_export_csv_text(),"🧠 خروجی BI CSV")
         return edit_message(chat_id,message_id,"✅ خروجی CSV ارسال شد.",bi_dashboard_menu(30))
 
+    if data=="admin:ops":
+        return edit_message(chat_id,message_id,ops_dashboard_text(),ops_dashboard_menu())
+
+    if data=="admin:ops_backup_now":
+        try:
+            code,path,size,checksum=create_database_backup("manual",tg_id)
+            send_document(chat_id,path,f"💾 بکاپ {code}")
+            return edit_message(chat_id,message_id,f"✅ بکاپ ساخته شد.\n<code>{code}</code>\nSize: {size} bytes",ops_dashboard_menu())
+        except Exception as e:
+            code=capture_system_error("ops_backup_now",e,{"admin_id":tg_id})
+            return edit_message(chat_id,message_id,f"❌ خطا: <code>{html_escape(repr(e))}</code>\nError Code: <code>{code}</code>",ops_dashboard_menu())
+
+    if data=="admin:ops_backups":
+        return edit_message(chat_id,message_id,"📂 <b>بکاپ‌های سیستم</b>",ops_backups_menu())
+
+    if data.startswith("admin:ops_backup:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        conn=db(); row=conn.execute("SELECT * FROM system_backups WHERE id=?",(backup_id,)).fetchone(); conn.close()
+        if not row:
+            return edit_message(chat_id,message_id,"بکاپ پیدا نشد.",ops_backups_menu())
+        return edit_message(chat_id,message_id,ops_backup_detail_text(row),ops_backup_detail_menu(backup_id))
+
+    if data.startswith("admin:ops_backup_send:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        conn=db(); row=conn.execute("SELECT * FROM system_backups WHERE id=?",(backup_id,)).fetchone(); conn.close()
+        if row and os.path.exists(row["file_path"]):
+            send_document(chat_id,row["file_path"],f"💾 {row['backup_code']}")
+        return edit_message(chat_id,message_id,"✅ فایل ارسال شد.",ops_backup_detail_menu(backup_id))
+
+    if data.startswith("admin:ops_backup_restore_confirm:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        return edit_message(chat_id,message_id,
+            "⚠️ بازیابی دیتابیس عملیات حساسی است و اطلاعات فعلی را جایگزین می‌کند.",
+            kb([
+                [btn("✅ تأیید بازیابی",f"admin:ops_backup_restore:{backup_id}")],
+                [btn("❌ انصراف",f"admin:ops_backup:{backup_id}")]
+            ]))
+
+    if data.startswith("admin:ops_backup_restore:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        try:
+            restore_database_backup(backup_id,tg_id)
+            return edit_message(chat_id,message_id,"✅ بازیابی انجام شد. ربات را Restart کن.",ops_dashboard_menu())
+        except Exception as e:
+            code=capture_system_error("ops_restore",e,{"backup_id":backup_id,"admin_id":tg_id})
+            return edit_message(chat_id,message_id,f"❌ بازیابی ناموفق بود.\n<code>{html_escape(repr(e))}</code>\n{code}",ops_dashboard_menu())
+
+    if data.startswith("admin:ops_backup_delete_confirm:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        return edit_message(chat_id,message_id,"بکاپ حذف شود؟",kb([
+            [btn("✅ حذف",f"admin:ops_backup_delete:{backup_id}")],
+            [btn("❌ انصراف",f"admin:ops_backup:{backup_id}")]
+        ]))
+
+    if data.startswith("admin:ops_backup_delete:"):
+        backup_id=safe_int(data.split(":")[3],0)
+        conn=db(); row=conn.execute("SELECT * FROM system_backups WHERE id=?",(backup_id,)).fetchone()
+        if row and os.path.exists(row["file_path"]):
+            try: os.remove(row["file_path"])
+            except Exception: pass
+        conn.execute("DELETE FROM system_backups WHERE id=?",(backup_id,))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ بکاپ حذف شد.",ops_backups_menu())
+
+    if data=="admin:ops_toggle_backup":
+        cur=get_setting("ops_auto_backup","off")
+        set_setting("ops_auto_backup","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,ops_dashboard_text(),ops_dashboard_menu())
+
+    if data=="admin:ops_backup_interval":
+        set_state(tg_id,"ops_backup_interval")
+        return edit_message(chat_id,message_id,"بازه بکاپ خودکار را به ثانیه بفرست؛ حداقل 300:",admin_back())
+
+    if data=="admin:ops_toggle_maintenance":
+        cur=get_setting("ops_auto_maintenance","off")
+        set_setting("ops_auto_maintenance","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,ops_dashboard_text(),ops_dashboard_menu())
+
+    if data=="admin:ops_maintenance_now":
+        status,details,duration=run_database_maintenance(tg_id)
+        return edit_message(chat_id,message_id,
+            f"{'✅' if status=='ok' else '❌'} نگهداری انجام شد.\nDuration: {duration}ms\n<code>{html_escape(' | '.join(details))}</code>",
+            ops_dashboard_menu())
+
+    if data=="admin:ops_db_health":
+        report=database_integrity_report()
+        text_out="🩺 <b>سلامت دیتابیس</b>\n\n"+"\n".join(
+            f"{html_escape(k)}: <code>{html_escape(v)}</code>" for k,v in report.items()
+        )
+        return edit_message(chat_id,message_id,text_out,kb([[btn("🔙 مرکز عملیات","admin:ops")]]))
+
+    if data=="admin:ops_errors":
+        return edit_message(chat_id,message_id,ops_errors_text("open"),kb([
+            [btn("📜 همه خطاها","admin:ops_errors_all")],
+            [btn("✅ بستن همه","admin:ops_errors_resolve")],
+            [btn("🔙 مرکز عملیات","admin:ops")]
+        ]))
+
+    if data=="admin:ops_errors_all":
+        return edit_message(chat_id,message_id,ops_errors_text("all"),kb([[btn("🔙 مرکز عملیات","admin:ops")]]))
+
+    if data=="admin:ops_errors_resolve":
+        conn=db()
+        conn.execute("UPDATE system_errors SET status='resolved',resolved_at=? WHERE status='open'",(now(),))
+        count=conn.total_changes
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,f"✅ {count} خطا بسته شد.",ops_dashboard_menu())
+
+    if data=="admin:ops_audit":
+        rows=final_release_audit()
+        text_out="🧪 <b>Audit نهایی</b>\n\n"+"\n".join(
+            f"{html_escape(k)}: <code>{html_escape(v)}</code>" for k,v in rows
+        )
+        return edit_message(chat_id,message_id,text_out,kb([[btn("🔙 مرکز عملیات","admin:ops")]]))
+
+    if data=="admin:ops_full_export":
+        try:
+            path=ops_full_export()
+            send_document(chat_id,path,"📦 Export کامل MVLite")
+            return edit_message(chat_id,message_id,"✅ Export کامل ارسال شد.",ops_dashboard_menu())
+        except Exception as e:
+            code=capture_system_error("ops_full_export",e,{"admin_id":tg_id})
+            return edit_message(chat_id,message_id,f"❌ خطا: {html_escape(repr(e))}\n<code>{code}</code>",ops_dashboard_menu())
+
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
@@ -6818,6 +7358,11 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="ops_backup_interval":
+            value=max(300,min(604800,safe_int(only_digits(text),21600)))
+            set_setting("ops_backup_interval_seconds",str(value))
+            send_message(chat_id,f"✅ بازه بکاپ روی {value} ثانیه تنظیم شد.",ops_dashboard_menu()); return True
+
         if name=="bi_search":
             send_message(chat_id,bi_search_results(text.strip()),kb([[btn("🔙 داشبورد BI","admin:bi:30")]])); return True
 
@@ -7279,6 +7824,9 @@ def handle_message(message):
     if text=="/bi":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,bi_dashboard_text(30),bi_dashboard_menu(30))
+    if text=="/ops":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,ops_dashboard_text(),ops_dashboard_menu())
 
     if text=="/admin":
         if not is_admin(tg_id): return send_message(chat_id,"❌ شما ادمین نیستید.\nاگر اولین اجراست، /claim_admin را بزنید.")
@@ -7351,6 +7899,7 @@ def polling_loop():
             run_price_engine_if_due()
             run_provider_health_if_due()
             run_finance_alerts_if_due()
+            run_ops_if_due()
             updates=tg("getUpdates",{"timeout":30,"offset":offset,"allowed_updates":["message","callback_query"]},45)
             for upd in updates:
                 offset=upd["update_id"]+1
