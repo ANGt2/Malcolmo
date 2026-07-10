@@ -44,6 +44,9 @@ Part 03 adds:
 - database indexes
 - health/admin diagnostics
 - release metadata
+- generic price API manager
+- admin API credentials/configuration
+- API connection test
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io
@@ -397,6 +400,17 @@ def init_db():
         "banner_text": "🔥 فروشگاه ووچر و سرویس‌های دیجیتال",
         "instagram_url": "",
         "website_url": "",
+        "price_api_enabled": "off",
+        "price_api_name": "",
+        "price_api_base_url": "",
+        "price_api_key": "",
+        "price_api_auth_header": "Authorization",
+        "price_api_auth_prefix": "Bearer",
+        "price_api_test_endpoint": "",
+        "price_api_timeout": "20",
+        "price_api_last_test_status": "never",
+        "price_api_last_test_at": "",
+        "price_api_last_test_message": "",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
@@ -603,6 +617,7 @@ def admin_menu():
         [btn(f"💳 پرداخت‌ها ({pending_pay})", "admin:payments"), btn("🧾 سفارش‌ها", "admin:orders")],
         [btn("📜 لاگ‌ها", "admin:logs"), btn("⚙️ تنظیمات", "admin:settings")],
         [btn("📣 پیام همگانی", "admin:broadcast"), btn("💾 بکاپ دیتابیس", "admin:backup")],
+        [btn("🌐 API قیمت‌ها", "admin:price_api")],
         [btn("🏠 منوی کاربر", "main")],
     ])
 
@@ -913,6 +928,108 @@ def admin_ticket_menu(ticket_id):
 
 
 
+
+
+# -------------------- Generic Price API Manager --------------------
+
+def mask_secret(value):
+    value = str(value or "")
+    if not value:
+        return "ثبت نشده"
+    if len(value) <= 8:
+        return "•" * len(value)
+    return f"{value[:4]}{'•' * min(12, len(value)-8)}{value[-4:]}"
+
+def normalize_base_url(url):
+    return str(url or "").strip().rstrip("/")
+
+def build_price_api_url(endpoint=""):
+    base = normalize_base_url(get_setting("price_api_base_url", ""))
+    endpoint = str(endpoint or "").strip()
+    if not endpoint:
+        return base
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        return endpoint
+    return f"{base}/{endpoint.lstrip('/')}"
+
+def price_api_headers():
+    key = get_setting("price_api_key", "")
+    header_name = get_setting("price_api_auth_header", "Authorization").strip() or "Authorization"
+    prefix = get_setting("price_api_auth_prefix", "Bearer").strip()
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+    }
+    if key:
+        headers[header_name] = f"{prefix} {key}".strip() if prefix else key
+    return headers
+
+def test_price_api_connection():
+    if get_setting("price_api_enabled", "off") != "on":
+        return False, "API غیرفعال است."
+    base_url = normalize_base_url(get_setting("price_api_base_url", ""))
+    if not base_url:
+        return False, "Base URL ثبت نشده است."
+    url = build_price_api_url(get_setting("price_api_test_endpoint", ""))
+    timeout = max(3, min(60, safe_int(get_setting("price_api_timeout", "20"), 20)))
+    req = urllib.request.Request(url, headers=price_api_headers(), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, "status", 200)
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read(1500).decode("utf-8", errors="replace")
+            preview = raw.strip().replace("\n", " ")[:300]
+            message = f"HTTP {status} | {content_type or 'unknown'}"
+            if preview:
+                message += f"\nPreview: {preview}"
+            ok = 200 <= int(status) < 400
+    except urllib.error.HTTPError as e:
+        body = e.read(800).decode("utf-8", errors="replace")
+        ok = False
+        message = f"HTTP {e.code}: {body[:500]}"
+    except Exception as e:
+        ok = False
+        message = repr(e)
+    set_setting("price_api_last_test_status", "ok" if ok else "failed")
+    set_setting("price_api_last_test_at", now())
+    set_setting("price_api_last_test_message", message)
+    return ok, message
+
+def price_api_admin_text():
+    enabled = get_setting("price_api_enabled", "off")
+    return f"""🌐 <b>مدیریت API قیمت‌ها — فاز ۱</b>
+
+وضعیت: <b>{'فعال ✅' if enabled == 'on' else 'غیرفعال ❌'}</b>
+نام API: {html_escape(get_setting('price_api_name','') or 'بدون نام')}
+Base URL:
+<code>{html_escape(get_setting('price_api_base_url','') or 'ثبت نشده')}</code>
+
+API Key:
+<code>{html_escape(mask_secret(get_setting('price_api_key','')))}</code>
+
+Auth Header: <code>{html_escape(get_setting('price_api_auth_header','Authorization'))}</code>
+Auth Prefix: <code>{html_escape(get_setting('price_api_auth_prefix','Bearer') or '(بدون پیشوند)')}</code>
+Test Endpoint: <code>{html_escape(get_setting('price_api_test_endpoint','') or '(خود Base URL)')}</code>
+Timeout: <code>{html_escape(get_setting('price_api_timeout','20'))}</code> ثانیه
+
+آخرین تست: <b>{html_escape(get_setting('price_api_last_test_status','never'))}</b>
+زمان: {html_escape(get_setting('price_api_last_test_at','') or '-')}
+
+پیام آخرین تست:
+<code>{html_escape(get_setting('price_api_last_test_message','') or '-')[:1200]}</code>
+"""
+
+def price_api_admin_menu():
+    return kb([
+        [btn("🔁 فعال/غیرفعال", "admin:price_api_toggle")],
+        [btn("🏷 نام API", "admin:price_api_set_name"), btn("🌐 Base URL", "admin:price_api_set_base")],
+        [btn("🔑 ثبت/تغییر API Key", "admin:price_api_set_key")],
+        [btn("🧾 Auth Header", "admin:price_api_set_header"), btn("🏷 Auth Prefix", "admin:price_api_set_prefix")],
+        [btn("🧪 Test Endpoint", "admin:price_api_set_test_endpoint"), btn("⏱ Timeout", "admin:price_api_set_timeout")],
+        [btn("🔍 تست اتصال", "admin:price_api_test")],
+        [btn("🗑 حذف API Key", "admin:price_api_clear_key")],
+        [btn("🔙 پنل ادمین", "admin:home")]
+    ])
 
 # -------------------- Release / Diagnostics --------------------
 
@@ -1890,6 +2007,38 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:home": clear_state(tg_id); return edit_message(chat_id,message_id,render_admin_home(),admin_menu())
     if data=="admin:stats": return edit_message(chat_id,message_id,render_admin_home(),admin_menu())
 
+    if data=="admin:price_api":
+        return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
+
+    if data=="admin:price_api_toggle":
+        current=get_setting("price_api_enabled","off")
+        set_setting("price_api_enabled","off" if current=="on" else "on")
+        log_admin(tg_id,"price_api_toggle",get_setting("price_api_enabled","off"))
+        return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
+
+    if data=="admin:price_api_test":
+        ok, message=test_price_api_connection()
+        title="✅ اتصال موفق بود." if ok else "❌ اتصال ناموفق بود."
+        return edit_message(chat_id,message_id,f"{title}\n\n<code>{html_escape(message)[:2500]}</code>",kb([[btn("🔙 مدیریت API","admin:price_api")]]))
+
+    if data=="admin:price_api_clear_key":
+        set_setting("price_api_key","")
+        log_admin(tg_id,"price_api_clear_key","")
+        return edit_message(chat_id,message_id,"✅ API Key حذف شد.",price_api_admin_menu())
+
+    for cb,state,prompt in [
+        ("admin:price_api_set_name","price_api_set_name","نام نمایشی API را ارسال کن:"),
+        ("admin:price_api_set_base","price_api_set_base","Base URL کامل API را ارسال کن. مثال:\nhttps://api.example.com"),
+        ("admin:price_api_set_key","price_api_set_key","API Key را ارسال کن. کلید بعداً ماسک‌شده نمایش داده می‌شود."),
+        ("admin:price_api_set_header","price_api_set_header","نام Header احراز هویت را ارسال کن. مثال: Authorization یا X-API-Key"),
+        ("admin:price_api_set_prefix","price_api_set_prefix","پیشوند کلید را ارسال کن. مثال: Bearer\nبرای بدون پیشوند، - را بفرست."),
+        ("admin:price_api_set_test_endpoint","price_api_set_test_endpoint","Endpoint تست را ارسال کن. مثال: /v1/ping\nبرای خود Base URL، - را بفرست."),
+        ("admin:price_api_set_timeout","price_api_set_timeout","Timeout را به ثانیه بفرست؛ بین 3 تا 60:")
+    ]:
+        if data==cb:
+            set_state(tg_id,state)
+            return edit_message(chat_id,message_id,prompt,admin_back())
+
     if data=="admin:release":
         return edit_message(chat_id,message_id,release_notes_text(),release_menu())
 
@@ -2592,6 +2741,31 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="price_api_set_name":
+            set_setting("price_api_name",text.strip()); log_admin(tg_id,"price_api_set_name",text.strip())
+            send_message(chat_id,"✅ نام API ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_base":
+            value=normalize_base_url(text)
+            if not (value.startswith("http://") or value.startswith("https://")):
+                send_message(chat_id,"❌ Base URL باید با http:// یا https:// شروع شود.",price_api_admin_menu()); return True
+            set_setting("price_api_base_url",value); log_admin(tg_id,"price_api_set_base",value)
+            send_message(chat_id,"✅ Base URL ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_key":
+            set_setting("price_api_key",text.strip()); log_admin(tg_id,"price_api_set_key","updated")
+            send_message(chat_id,"✅ API Key ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_header":
+            value=text.strip() or "Authorization"; set_setting("price_api_auth_header",value)
+            send_message(chat_id,"✅ Auth Header ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_prefix":
+            value=text.strip(); value="" if value=="-" else value; set_setting("price_api_auth_prefix",value)
+            send_message(chat_id,"✅ Auth Prefix ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_test_endpoint":
+            value=text.strip(); value="" if value=="-" else value; set_setting("price_api_test_endpoint",value)
+            send_message(chat_id,"✅ Test Endpoint ذخیره شد.",price_api_admin_menu()); return True
+        if name=="price_api_set_timeout":
+            value=max(3,min(60,safe_int(only_digits(text),20))); set_setting("price_api_timeout",str(value))
+            send_message(chat_id,f"✅ Timeout روی {value} ثانیه تنظیم شد.",price_api_admin_menu()); return True
+
         if name=="coupon_add_code":
             code=text.strip().upper().replace(" ","")
             if not code:
@@ -2834,6 +3008,9 @@ def handle_message(message):
     if text=="/diag":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,diagnostics_text(),release_menu())
+    if text=="/priceapi":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,price_api_admin_text(),price_api_admin_menu())
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
@@ -2888,4 +3065,5 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
