@@ -57,6 +57,10 @@ Part 03 adds:
 - order profit snapshots
 - automatic sales/refund accounting
 - admin finance dashboard and exports
+- advanced finance reports and ranking dashboards
+- configurable operational alerts
+- supplier, product and customer analytics
+- scheduled alert checks and admin notifications
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib
@@ -402,6 +406,34 @@ def init_db():
         except sqlite3.OperationalError:
             pass
 
+    c.execute("""CREATE TABLE IF NOT EXISTS finance_alert_rules (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        threshold_value REAL DEFAULT 0,
+        threshold_text TEXT DEFAULT '',
+        is_active INTEGER DEFAULT 1,
+        cooldown_seconds INTEGER DEFAULT 3600,
+        last_triggered_at TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(rule_type)
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS finance_alert_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        rule_id INTEGER DEFAULT 0,
+        rule_type TEXT NOT NULL,
+        severity TEXT DEFAULT 'warning',
+        title TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        entity_type TEXT DEFAULT '',
+        entity_id INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        resolved_at TEXT DEFAULT ''
+    )""")
+
     c.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         admin_tg_id INTEGER NOT NULL,
@@ -717,9 +749,31 @@ def init_db():
         "price_engine_recalc_after_sync": "on",
         "price_engine_history_enabled": "on",
         "price_engine_last_auto_run": "",
+        "finance_alerts_auto_check": "off",
+        "finance_alerts_interval_seconds": "300",
+        "finance_alerts_last_run": "",
+        "finance_negative_profit_threshold": "0",
+        "finance_pending_order_hours": "6",
+        "finance_expiry_warning_days": "7",
+        "finance_price_deviation_percent": "10",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
+
+    alert_rules = [
+        ("low_stock","موجودی کم",5,"",1,3600),
+        ("expiring_codes","کدهای نزدیک انقضا",7,"days",1,21600),
+        ("stuck_orders","سفارش‌های معطل",6,"hours",1,3600),
+        ("negative_profit","سود منفی",0,"",1,3600),
+        ("provider_failure","خطای Provider",0,"",1,1800),
+    ]
+    for rule_type,title,threshold_value,threshold_text,is_active,cooldown in alert_rules:
+        c.execute("""INSERT OR IGNORE INTO finance_alert_rules(
+                     rule_type,title,threshold_value,threshold_text,is_active,
+                     cooldown_seconds,last_triggered_at,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                  (rule_type,title,threshold_value,threshold_text,is_active,
+                   cooldown,"",now(),now()))
 
     seed = [
         ("🔥 Hot Voucher", "hot_voucher", "بخش هات ووچر - محصولات را از پنل ادمین اضافه کنید.", 1, 10),
@@ -767,6 +821,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_profit_order ON profit_snapshots(order_id)",
         "CREATE INDEX IF NOT EXISTS idx_profit_created ON profit_snapshots(created_at)",
         "CREATE INDEX IF NOT EXISTS idx_finance_logs_entity ON finance_logs(entity_type,entity_id)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_alert_events_status ON finance_alert_events(status,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_alert_events_type ON finance_alert_events(rule_type,created_at)",
     ]
     for q in indexes:
         c.execute(q)
@@ -1145,6 +1201,7 @@ def finance_dashboard_menu(period="today"):
         [btn("۷ روز", "admin:finance:week"), btn("ماه", "admin:finance:month")],
         [btn("سال", "admin:finance:year"), btn("کل", "admin:finance:all")],
         [btn("📜 آخرین تراکنش‌ها", "admin:finance_transactions:0")],
+        [btn("📊 گزارش‌های پیشرفته", "admin:finance_reports")],
         [btn("🔄 بازسازی مالی سفارش‌ها", "admin:finance_rebuild_confirm")],
         [btn("📤 خروجی CSV", "admin:finance_export_csv"),
          btn("📤 خروجی JSON", "admin:finance_export_json")],
@@ -1244,6 +1301,328 @@ def finance_export_json_text():
         "profit_snapshots": [dict(row) for row in profit_rows],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+# -------------------- Advanced Reports / Alerts --------------------
+
+FINANCE_ALERT_NEXT_RUN = 0
+
+
+def report_date_clause(period, column="created_at"):
+    return finance_period_clause(period).replace("created_at", column)
+
+
+def product_finance_report(period="month", limit=15):
+    clause = report_date_clause(period, "ps.created_at")
+    conn = db()
+    rows = conn.execute(f"""SELECT
+        ps.product_id,
+        ps.product_title,
+        COUNT(*) order_count,
+        COALESCE(SUM(ps.sale_amount),0) sales,
+        COALESCE(SUM(ps.purchase_cost),0) costs,
+        COALESCE(SUM(ps.net_profit),0) profit,
+        COALESCE(AVG(ps.net_profit),0) avg_profit
+        FROM profit_snapshots ps
+        WHERE {clause}
+        GROUP BY ps.product_id,ps.product_title
+        ORDER BY sales DESC
+        LIMIT ?""", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
+def customer_finance_report(period="month", limit=15):
+    clause = report_date_clause(period, "ps.created_at")
+    conn = db()
+    rows = conn.execute(f"""SELECT
+        ps.user_id,
+        COALESCE(u.username,'') username,
+        COALESCE(u.first_name,'') first_name,
+        COUNT(*) order_count,
+        COALESCE(SUM(ps.sale_amount),0) sales,
+        COALESCE(SUM(ps.net_profit),0) profit
+        FROM profit_snapshots ps
+        LEFT JOIN users u ON u.tg_id=ps.user_id
+        WHERE {clause}
+        GROUP BY ps.user_id,u.username,u.first_name
+        ORDER BY sales DESC
+        LIMIT ?""", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
+def supplier_finance_report(limit=15):
+    conn = db()
+    rows = conn.execute("""SELECT
+        s.id supplier_id,
+        s.name supplier_name,
+        COUNT(DISTINCT b.id) batch_count,
+        COUNT(pc.id) total_codes,
+        COALESCE(SUM(pc.unit_cost),0) purchased_value,
+        COALESCE(SUM(CASE WHEN pc.status='available' THEN pc.unit_cost ELSE 0 END),0) available_value,
+        COALESCE(SUM(CASE WHEN pc.status='used' THEN pc.unit_cost ELSE 0 END),0) consumed_value,
+        SUM(CASE WHEN pc.status='available' THEN 1 ELSE 0 END) available_count,
+        SUM(CASE WHEN pc.status='used' THEN 1 ELSE 0 END) used_count
+        FROM voucher_suppliers s
+        LEFT JOIN voucher_stock_batches b ON b.supplier_id=s.id
+        LEFT JOIN product_codes pc ON pc.batch_id=b.id
+        GROUP BY s.id,s.name
+        ORDER BY purchased_value DESC
+        LIMIT ?""", (limit,)).fetchall()
+    conn.close()
+    return rows
+
+
+def report_products_text(period="month"):
+    rows = product_finance_report(period)
+    lines = [f"📦 <b>گزارش محصولات — {finance_period_title(period)}</b>\n"]
+    if not rows:
+        lines.append("داده‌ای ثبت نشده است.")
+    for i,row in enumerate(rows,1):
+        lines.append(
+            f"{i}. <b>{html_escape(row['product_title'] or '-')}</b>\n"
+            f"سفارش: {row['order_count']} | فروش: {money(row['sales'])} | "
+            f"سود: {money(row['profit'])} تومان"
+        )
+    return "\n\n".join(lines)
+
+
+def report_customers_text(period="month"):
+    rows = customer_finance_report(period)
+    lines = [f"👥 <b>گزارش مشتریان — {finance_period_title(period)}</b>\n"]
+    if not rows:
+        lines.append("داده‌ای ثبت نشده است.")
+    for i,row in enumerate(rows,1):
+        name = row["username"] and f"@{row['username']}" or row["first_name"] or str(row["user_id"])
+        lines.append(
+            f"{i}. <b>{html_escape(name)}</b>\n"
+            f"خرید: {row['order_count']} | مبلغ: {money(row['sales'])} | "
+            f"سود: {money(row['profit'])} تومان"
+        )
+    return "\n\n".join(lines)
+
+
+def report_suppliers_text():
+    rows = supplier_finance_report()
+    lines = ["🏭 <b>گزارش تأمین‌کننده‌ها</b>\n"]
+    if not rows:
+        lines.append("داده‌ای ثبت نشده است.")
+    for i,row in enumerate(rows,1):
+        lines.append(
+            f"{i}. <b>{html_escape(row['supplier_name'] or '-')}</b>\n"
+            f"بچ: {row['batch_count']} | کد: {row['total_codes']} | "
+            f"آماده: {row['available_count'] or 0} | مصرف‌شده: {row['used_count'] or 0}\n"
+            f"ارزش خرید: {money(row['purchased_value'])} | "
+            f"ارزش موجودی: {money(row['available_value'])} تومان"
+        )
+    return "\n\n".join(lines)
+
+
+def finance_reports_menu():
+    return kb([
+        [btn("📦 محصولات این ماه","admin:finance_report_products:month")],
+        [btn("👥 مشتریان این ماه","admin:finance_report_customers:month")],
+        [btn("🏭 تأمین‌کننده‌ها","admin:finance_report_suppliers")],
+        [btn("⚠️ مرکز هشدارها","admin:finance_alerts")],
+        [btn("🔙 مرکز مالی","admin:finance:today")]
+    ])
+
+
+def finance_alert_rules_text():
+    conn = db()
+    rows = conn.execute("SELECT * FROM finance_alert_rules ORDER BY id").fetchall()
+    conn.close()
+    lines = [
+        "⚠️ <b>مرکز هشدارهای عملیاتی</b>\n",
+        f"بررسی خودکار: <b>{'فعال ✅' if get_setting('finance_alerts_auto_check','off')=='on' else 'غیرفعال ❌'}</b>",
+        f"بازه بررسی: <code>{get_setting('finance_alerts_interval_seconds','300')}</code> ثانیه",
+        f"آخرین اجرا: {html_escape(get_setting('finance_alerts_last_run','') or '-')}\n"
+    ]
+    for row in rows:
+        lines.append(
+            f"{'✅' if row['is_active'] else '❌'} <b>{html_escape(row['title'])}</b> | "
+            f"حد: <code>{row['threshold_value']}</code> {html_escape(row['threshold_text'] or '')}"
+        )
+    return "\n".join(lines)
+
+
+def finance_alerts_menu():
+    return kb([
+        [btn("🔁 بررسی خودکار روشن/خاموش","admin:finance_alerts_toggle")],
+        [btn("⏱ تغییر بازه بررسی","admin:finance_alerts_interval")],
+        [btn("🧪 اجرای بررسی الآن","admin:finance_alerts_run")],
+        [btn("📜 رخدادهای باز","admin:finance_alert_events:open")],
+        [btn("📜 تمام رخدادها","admin:finance_alert_events:all")],
+        [btn("🧹 بستن همه رخدادهای باز","admin:finance_alerts_resolve_all")],
+        [btn("🔙 گزارش‌های پیشرفته","admin:finance_reports")]
+    ])
+
+
+def alert_rule_allowed(conn, rule_type):
+    row = conn.execute("SELECT * FROM finance_alert_rules WHERE rule_type=?", (rule_type,)).fetchone()
+    if not row or not row["is_active"]:
+        return False, None
+    last = parse_dt(row["last_triggered_at"])
+    if last:
+        elapsed = (datetime.now() - last).total_seconds()
+        if elapsed < int(row["cooldown_seconds"] or 0):
+            return False, row
+    return True, row
+
+
+def create_finance_alert(conn, rule_type, severity, title, message,
+                         entity_type="", entity_id=0):
+    allowed, rule = alert_rule_allowed(conn, rule_type)
+    if not allowed:
+        return 0
+    conn.execute("""INSERT INTO finance_alert_events(
+                    rule_id,rule_type,severity,title,message,
+                    entity_type,entity_id,status,created_at,resolved_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                 (
+                     int(rule["id"] if rule else 0), rule_type, severity,
+                     title, message[:3000], entity_type, int(entity_id or 0),
+                     "open", now(), ""
+                 ))
+    event_id = conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+    if rule:
+        conn.execute("UPDATE finance_alert_rules SET last_triggered_at=?,updated_at=? WHERE id=?",
+                     (now(), now(), rule["id"]))
+    return int(event_id)
+
+
+def run_finance_alert_checks(trigger="manual"):
+    normalize_stock_statuses()
+    conn = db()
+    created = []
+
+    # Low stock
+    low_rows = conn.execute("""SELECT p.id,p.title,p.low_stock_threshold,
+                              (SELECT COUNT(*) FROM product_codes pc
+                               WHERE pc.product_id=p.id AND pc.status='available') available_count
+                              FROM products p
+                              WHERE p.stock_mode='code' AND p.stock_alert_enabled=1""").fetchall()
+    for row in low_rows:
+        if int(row["available_count"] or 0) <= int(row["low_stock_threshold"] or 0):
+            event_id = create_finance_alert(
+                conn, "low_stock", "warning", "موجودی کم",
+                f"{row['title']} فقط {row['available_count']} کد آماده دارد.",
+                "product", row["id"]
+            )
+            if event_id: created.append(event_id)
+
+    # Expiring codes
+    warning_days = max(1, safe_int(get_setting("finance_expiry_warning_days","7"),7))
+    expiring = conn.execute("""SELECT pc.id,pc.product_id,pc.expires_at,p.title
+                              FROM product_codes pc
+                              LEFT JOIN products p ON p.id=pc.product_id
+                              WHERE pc.status='available' AND pc.expires_at!=''""").fetchall()
+    for row in expiring:
+        try:
+            days = (datetime.strptime(row["expires_at"][:10],"%Y-%m-%d").date() - datetime.now().date()).days
+        except Exception:
+            continue
+        if 0 <= days <= warning_days:
+            event_id = create_finance_alert(
+                conn, "expiring_codes", "warning", "کد نزدیک انقضا",
+                f"کد #{row['id']} محصول {row['title'] or '-'} تا {days} روز دیگر منقضی می‌شود.",
+                "product_code", row["id"]
+            )
+            if event_id: created.append(event_id)
+
+    # Stuck orders
+    stuck_hours = max(1, safe_int(get_setting("finance_pending_order_hours","6"),6))
+    stuck_rows = conn.execute("""SELECT id,order_code,status,created_at
+                                FROM orders
+                                WHERE status IN ('pending','pending_processing','processing','ready')
+                                AND datetime(created_at)<=datetime('now','localtime',?)""",
+                             (f"-{stuck_hours} hours",)).fetchall()
+    for row in stuck_rows:
+        event_id = create_finance_alert(
+            conn, "stuck_orders", "warning", "سفارش معطل",
+            f"سفارش {row['order_code']} با وضعیت {row['status']} بیش از {stuck_hours} ساعت معطل مانده است.",
+            "order", row["id"]
+        )
+        if event_id: created.append(event_id)
+
+    # Negative profit
+    negative_rows = conn.execute("""SELECT order_id,order_code,net_profit
+                                   FROM profit_snapshots WHERE net_profit<0
+                                   ORDER BY id DESC LIMIT 50""").fetchall()
+    for row in negative_rows:
+        event_id = create_finance_alert(
+            conn, "negative_profit", "critical", "سود منفی",
+            f"سفارش {row['order_code']} دارای سود خالص {row['net_profit']} تومان است.",
+            "order", row["order_id"]
+        )
+        if event_id: created.append(event_id)
+
+    # Provider failure
+    provider_rows = conn.execute("""SELECT id,name,last_status,last_error
+                                   FROM api_providers
+                                   WHERE is_active=1 AND last_status='failed'""").fetchall()
+    for row in provider_rows:
+        event_id = create_finance_alert(
+            conn, "provider_failure", "critical", "خطای Provider",
+            f"Provider {row['name']} ناموفق است: {row['last_error'] or '-'}",
+            "api_provider", row["id"]
+        )
+        if event_id: created.append(event_id)
+
+    finance_log(
+        conn, "run_alert_checks", "system", 0,
+        new_value=f"created={len(created)}", detail=trigger
+    )
+    conn.commit(); conn.close()
+    set_setting("finance_alerts_last_run", now())
+    return created
+
+
+def finance_alert_events_text(mode="open"):
+    conn = db()
+    if mode == "open":
+        rows = conn.execute("""SELECT * FROM finance_alert_events
+                               WHERE status='open' ORDER BY id DESC LIMIT 60""").fetchall()
+    else:
+        rows = conn.execute("""SELECT * FROM finance_alert_events
+                               ORDER BY id DESC LIMIT 60""").fetchall()
+    conn.close()
+    lines = [f"📜 <b>هشدارها — {'باز' if mode=='open' else 'همه'}</b>\n"]
+    if not rows:
+        lines.append("رخدادی وجود ندارد.")
+    for row in rows:
+        icon = "🔴" if row["severity"] == "critical" else "🟡"
+        lines.append(
+            f"{icon} #{row['id']} <b>{html_escape(row['title'])}</b>\n"
+            f"{html_escape(row['message'])}\n"
+            f"{row['created_at']} | {html_escape(row['status'])}"
+        )
+    return "\n\n".join(lines)
+
+
+def finance_alert_due():
+    global FINANCE_ALERT_NEXT_RUN
+    if get_setting("finance_alerts_auto_check","off") != "on":
+        return False
+    current = time.time()
+    if FINANCE_ALERT_NEXT_RUN <= 0:
+        FINANCE_ALERT_NEXT_RUN = current + 10
+    return current >= FINANCE_ALERT_NEXT_RUN
+
+
+def run_finance_alerts_if_due():
+    global FINANCE_ALERT_NEXT_RUN
+    if not finance_alert_due():
+        return
+    interval = max(60, min(86400, safe_int(get_setting("finance_alerts_interval_seconds","300"),300)))
+    FINANCE_ALERT_NEXT_RUN = time.time() + interval
+    created = run_finance_alert_checks("auto")
+    if created and OWNER_ID:
+        try:
+            send_message(OWNER_ID, f"⚠️ {len(created)} هشدار جدید در MVLite ثبت شد.", finance_alerts_menu())
+        except Exception as e:
+            print("FINANCE ALERT NOTIFY ERROR:", repr(e))
 
 # -------------------- State --------------------
 
@@ -4811,6 +5190,48 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
         )
         return edit_message(chat_id,message_id,"✅ خروجی JSON ارسال شد.",finance_dashboard_menu("today"))
 
+    if data=="admin:finance_reports":
+        return edit_message(chat_id,message_id,"📊 <b>گزارش‌های پیشرفته مالی</b>",finance_reports_menu())
+
+    if data.startswith("admin:finance_report_products:"):
+        period=data.split(":")[3]
+        return edit_message(chat_id,message_id,report_products_text(period),kb([[btn("🔙 گزارش‌ها","admin:finance_reports")]]))
+
+    if data.startswith("admin:finance_report_customers:"):
+        period=data.split(":")[3]
+        return edit_message(chat_id,message_id,report_customers_text(period),kb([[btn("🔙 گزارش‌ها","admin:finance_reports")]]))
+
+    if data=="admin:finance_report_suppliers":
+        return edit_message(chat_id,message_id,report_suppliers_text(),kb([[btn("🔙 گزارش‌ها","admin:finance_reports")]]))
+
+    if data=="admin:finance_alerts":
+        return edit_message(chat_id,message_id,finance_alert_rules_text(),finance_alerts_menu())
+
+    if data=="admin:finance_alerts_toggle":
+        cur=get_setting("finance_alerts_auto_check","off")
+        set_setting("finance_alerts_auto_check","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,finance_alert_rules_text(),finance_alerts_menu())
+
+    if data=="admin:finance_alerts_interval":
+        set_state(tg_id,"finance_alerts_interval")
+        return edit_message(chat_id,message_id,"بازه بررسی هشدارها را به ثانیه بفرست؛ بین 60 تا 86400:",admin_back())
+
+    if data=="admin:finance_alerts_run":
+        created=run_finance_alert_checks("manual")
+        return edit_message(chat_id,message_id,f"✅ بررسی تمام شد. هشدار جدید: <b>{len(created)}</b>",finance_alerts_menu())
+
+    if data.startswith("admin:finance_alert_events:"):
+        mode=data.split(":")[3]
+        return edit_message(chat_id,message_id,finance_alert_events_text(mode),kb([[btn("🔙 هشدارها","admin:finance_alerts")]]))
+
+    if data=="admin:finance_alerts_resolve_all":
+        conn=db()
+        conn.execute("UPDATE finance_alert_events SET status='resolved',resolved_at=? WHERE status='open'",(now(),))
+        count=conn.total_changes
+        finance_log(conn,"resolve_all_alerts","finance_alert",0,new_value=str(count),admin_id=tg_id)
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,f"✅ {count} هشدار بسته شد.",finance_alerts_menu())
+
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
@@ -6099,6 +6520,11 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="finance_alerts_interval":
+            value=max(60,min(86400,safe_int(only_digits(text),300)))
+            set_setting("finance_alerts_interval_seconds",str(value))
+            send_message(chat_id,f"✅ بازه بررسی روی {value} ثانیه تنظیم شد.",finance_alerts_menu()); return True
+
         if name=="provider_health_interval":
             value=max(60,min(86400,safe_int(only_digits(text),300)))
             set_setting("provider_health_check_interval",str(value))
@@ -6546,6 +6972,9 @@ def handle_message(message):
     if text=="/finance":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,finance_dashboard_text("today"),finance_dashboard_menu("today"))
+    if text=="/financereports":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,"📊 گزارش‌های پیشرفته مالی",finance_reports_menu())
 
     if text=="/admin":
         if not is_admin(tg_id): return send_message(chat_id,"❌ شما ادمین نیستید.\nاگر اولین اجراست، /claim_admin را بزنید.")
@@ -6617,6 +7046,7 @@ def polling_loop():
         try:
             run_price_engine_if_due()
             run_provider_health_if_due()
+            run_finance_alerts_if_due()
             updates=tg("getUpdates",{"timeout":30,"offset":offset,"allowed_updates":["message","callback_query"]},45)
             for upd in updates:
                 offset=upd["update_id"]+1
