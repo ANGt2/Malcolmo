@@ -55,7 +55,7 @@ Part 03 adds:
 - fixed/online product price modes
 """
 
-import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io
+import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib
 from datetime import datetime
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8979540158:AAGho_VCJlaYaggrhhcXQlAUm4KOv8sXfhU")
@@ -421,6 +421,65 @@ def init_db():
         FOREIGN KEY(product_id) REFERENCES products(id)
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS voucher_suppliers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        contact TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        is_active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS voucher_stock_batches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        batch_code TEXT UNIQUE NOT NULL,
+        product_id INTEGER NOT NULL,
+        supplier_id INTEGER DEFAULT 0,
+        title TEXT DEFAULT '',
+        quantity INTEGER DEFAULT 0,
+        unit_cost INTEGER DEFAULT 0,
+        currency TEXT DEFAULT 'IRT',
+        expires_at TEXT DEFAULT '',
+        note TEXT DEFAULT '',
+        status TEXT DEFAULT 'open',
+        created_by INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(product_id) REFERENCES products(id)
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS voucher_stock_movements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        product_id INTEGER NOT NULL,
+        code_id INTEGER DEFAULT 0,
+        batch_id INTEGER DEFAULT 0,
+        movement_type TEXT NOT NULL,
+        quantity INTEGER DEFAULT 0,
+        reference_type TEXT DEFAULT '',
+        reference_id INTEGER DEFAULT 0,
+        note TEXT DEFAULT '',
+        admin_id INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    )""")
+
+    for column_sql in [
+        "ALTER TABLE product_codes ADD COLUMN batch_id INTEGER DEFAULT 0",
+        "ALTER TABLE product_codes ADD COLUMN supplier_id INTEGER DEFAULT 0",
+        "ALTER TABLE product_codes ADD COLUMN unit_cost INTEGER DEFAULT 0",
+        "ALTER TABLE product_codes ADD COLUMN expires_at TEXT DEFAULT ''",
+        "ALTER TABLE product_codes ADD COLUMN note TEXT DEFAULT ''",
+        "ALTER TABLE product_codes ADD COLUMN reserved_at TEXT DEFAULT ''",
+        "ALTER TABLE product_codes ADD COLUMN checksum TEXT DEFAULT ''",
+        "ALTER TABLE product_codes ADD COLUMN updated_at TEXT DEFAULT ''",
+        "ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAULT 5",
+        "ALTER TABLE products ADD COLUMN stock_alert_enabled INTEGER DEFAULT 1"
+    ]:
+        try:
+            c.execute(column_sql)
+        except sqlite3.OperationalError:
+            pass
+
     c.execute("""CREATE TABLE IF NOT EXISTS faqs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         question TEXT NOT NULL,
@@ -611,6 +670,10 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_products_active ON products(is_active)",
         "CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)",
+        "CREATE INDEX IF NOT EXISTS idx_codes_product_status_expiry ON product_codes(product_id,status,expires_at)",
+        "CREATE INDEX IF NOT EXISTS idx_codes_batch ON product_codes(batch_id)",
+        "CREATE INDEX IF NOT EXISTS idx_batches_product_status ON voucher_stock_batches(product_id,status)",
+        "CREATE INDEX IF NOT EXISTS idx_movements_product_time ON voucher_stock_movements(product_id,created_at)",
         "CREATE INDEX IF NOT EXISTS idx_orders_code ON orders(order_code)",
         "CREATE INDEX IF NOT EXISTS idx_orders_product ON orders(product_id)",
         "CREATE INDEX IF NOT EXISTS idx_order_history_order ON order_status_history(order_id,id)",
@@ -807,6 +870,7 @@ def admin_menu():
         [btn("📜 لاگ‌ها", "admin:logs"), btn("⚙️ تنظیمات", "admin:settings")],
         [btn("📣 پیام همگانی", "admin:broadcast"), btn("💾 بکاپ دیتابیس", "admin:backup")],
         [btn("🌐 API قیمت‌ها", "admin:price_api")],
+        [btn("📦 انبار حرفه‌ای ووچر", "admin:inventory")],
         [btn("🏠 منوی کاربر", "main")],
     ])
 
@@ -3320,6 +3384,291 @@ def admin_faq_detail_menu(faq_id):
         [btn("🔙 سوالات", "admin:faqs")]
     ])
 
+
+# -------------------- Voucher Inventory Pro --------------------
+
+def make_batch_code():
+    return f"VB-{datetime.now().strftime('%y%m%d')}-{random.randint(100000,999999)}"
+
+def code_checksum(product_id, code_text):
+    raw = f"{int(product_id)}|{str(code_text).strip()}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def stock_code_is_expired(row):
+    value = str(row["expires_at"] or "").strip() if row and "expires_at" in row.keys() else ""
+    if not value:
+        return False
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date() < datetime.now().date()
+    except Exception:
+        return False
+
+def normalize_stock_statuses():
+    conn = db()
+    rows = conn.execute("""SELECT id,expires_at FROM product_codes
+                           WHERE status='available' AND expires_at!=''""").fetchall()
+    expired_ids = [r["id"] for r in rows if stock_code_is_expired(r)]
+    for code_id in expired_ids:
+        conn.execute("UPDATE product_codes SET status='expired',updated_at=? WHERE id=?",(now(),code_id))
+    conn.commit(); conn.close()
+    return len(expired_ids)
+
+def inventory_movement(product_id, movement_type, quantity, code_id=0, batch_id=0,
+                       reference_type="", reference_id=0, note="", admin_id=0, conn=None):
+    own = conn is None
+    if own:
+        conn = db()
+    conn.execute("""INSERT INTO voucher_stock_movements(
+                    product_id,code_id,batch_id,movement_type,quantity,
+                    reference_type,reference_id,note,admin_id,created_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                 (product_id,code_id,batch_id,movement_type,quantity,
+                  reference_type,reference_id,str(note or "")[:1500],admin_id,now()))
+    if own:
+        conn.commit(); conn.close()
+
+def inventory_counts(product_id):
+    normalize_stock_statuses()
+    conn = db()
+    rows = conn.execute("""SELECT status,COUNT(*) n FROM product_codes
+                           WHERE product_id=? GROUP BY status""",(product_id,)).fetchall()
+    conn.close()
+    result = {"available":0,"reserved":0,"used":0,"disabled":0,"expired":0}
+    for row in rows:
+        result[row["status"]] = row["n"]
+    return result
+
+def inventory_total_cost(product_id, only_available=False):
+    conn = db()
+    q = "SELECT COALESCE(SUM(unit_cost),0) n FROM product_codes WHERE product_id=?"
+    if only_available:
+        q += " AND status='available'"
+    value = conn.execute(q,(product_id,)).fetchone()["n"]
+    conn.close()
+    return int(value or 0)
+
+def inventory_dashboard_text():
+    normalize_stock_statuses()
+    conn=db()
+    totals=conn.execute("""SELECT
+        SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) available,
+        SUM(CASE WHEN status='reserved' THEN 1 ELSE 0 END) reserved,
+        SUM(CASE WHEN status='used' THEN 1 ELSE 0 END) used,
+        SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) expired,
+        SUM(CASE WHEN status='disabled' THEN 1 ELSE 0 END) disabled,
+        COALESCE(SUM(CASE WHEN status='available' THEN unit_cost ELSE 0 END),0) available_cost
+        FROM product_codes""").fetchone()
+    batches=conn.execute("SELECT COUNT(*) n FROM voucher_stock_batches").fetchone()["n"]
+    suppliers=conn.execute("SELECT COUNT(*) n FROM voucher_suppliers WHERE is_active=1").fetchone()["n"]
+    low=conn.execute("""SELECT COUNT(*) n FROM products p
+                        WHERE p.stock_mode='code' AND p.stock_alert_enabled=1
+                        AND (SELECT COUNT(*) FROM product_codes pc
+                             WHERE pc.product_id=p.id AND pc.status='available')
+                            <= p.low_stock_threshold""").fetchone()["n"]
+    conn.close()
+    return f"""📦 <b>انبار حرفه‌ای ووچر</b>
+
+آماده: <b>{totals['available'] or 0}</b>
+رزرو: <b>{totals['reserved'] or 0}</b>
+مصرف‌شده: <b>{totals['used'] or 0}</b>
+منقضی: <b>{totals['expired'] or 0}</b>
+غیرفعال: <b>{totals['disabled'] or 0}</b>
+
+ارزش خرید موجودی آماده:
+<b>{money(totals['available_cost'] or 0)}</b> تومان
+
+بچ‌ها: <b>{batches}</b>
+تأمین‌کننده فعال: <b>{suppliers}</b>
+محصولات کم‌موجودی: <b>{low}</b>
+"""
+
+def inventory_dashboard_menu():
+    return kb([
+        [btn("📦 موجودی محصولات","admin:stock"),btn("📥 ورود بچ جدید","admin:batch_product_select")],
+        [btn("🏭 تأمین‌کننده‌ها","admin:suppliers"),btn("🗂 بچ‌های موجودی","admin:batches")],
+        [btn("⚠️ هشدار موجودی کم","admin:inventory_low"),btn("⏳ کدهای منقضی","admin:inventory_expired")],
+        [btn("📜 گردش موجودی","admin:inventory_movements"),btn("📤 خروجی موجودی CSV","admin:inventory_export")],
+        [btn("🔙 پنل ادمین","admin:home")]
+    ])
+
+def suppliers_menu():
+    conn=db()
+    rows=conn.execute("SELECT * FROM voucher_suppliers ORDER BY is_active DESC,id DESC LIMIT 50").fetchall()
+    conn.close()
+    buttons=[[btn("➕ افزودن تأمین‌کننده","admin:supplier_add")]]
+    for r in rows:
+        st="✅" if r["is_active"] else "❌"
+        buttons.append([btn(f"{st} #{r['id']} {r['name']}",f"admin:supplier:{r['id']}")])
+    buttons.append([btn("🔙 انبار حرفه‌ای","admin:inventory")])
+    return kb(buttons)
+
+def supplier_text(row):
+    return f"""🏭 <b>تأمین‌کننده</b>
+
+ID: <code>{row['id']}</code>
+نام: <b>{html_escape(row['name'])}</b>
+ارتباط: {html_escape(row['contact'] or '-')}
+وضعیت: {'فعال ✅' if row['is_active'] else 'غیرفعال ❌'}
+
+یادداشت:
+{html_escape(row['note'] or '-')}
+"""
+
+def supplier_menu(supplier_id):
+    return kb([
+        [btn("✏️ نام",f"admin:supplier_name:{supplier_id}"),btn("📞 ارتباط",f"admin:supplier_contact:{supplier_id}")],
+        [btn("📝 یادداشت",f"admin:supplier_note:{supplier_id}"),btn("🔁 فعال/غیرفعال",f"admin:supplier_toggle:{supplier_id}")],
+        [btn("🗑 حذف",f"admin:supplier_delete_confirm:{supplier_id}")],
+        [btn("🔙 تأمین‌کننده‌ها","admin:suppliers")]
+    ])
+
+def batch_product_select_menu():
+    conn=db()
+    rows=conn.execute("SELECT id,title FROM products ORDER BY id DESC LIMIT 80").fetchall()
+    conn.close()
+    buttons=[[btn(f"#{r['id']} {r['title']}",f"admin:batch_start:{r['id']}")] for r in rows]
+    buttons.append([btn("🔙 انبار حرفه‌ای","admin:inventory")])
+    return kb(buttons)
+
+def batches_menu():
+    conn=db()
+    rows=conn.execute("""SELECT b.*,p.title product_title,s.name supplier_name,
+                         (SELECT COUNT(*) FROM product_codes pc WHERE pc.batch_id=b.id AND pc.status='available') available_count,
+                         (SELECT COUNT(*) FROM product_codes pc WHERE pc.batch_id=b.id AND pc.status='used') used_count
+                         FROM voucher_stock_batches b
+                         LEFT JOIN products p ON p.id=b.product_id
+                         LEFT JOIN voucher_suppliers s ON s.id=b.supplier_id
+                         ORDER BY b.id DESC LIMIT 60""").fetchall()
+    conn.close()
+    buttons=[]
+    for r in rows:
+        buttons.append([btn(f"#{r['id']} {r['batch_code']} | {r['product_title'] or '-'} | آماده:{r['available_count']}",f"admin:batch:{r['id']}")])
+    if not rows:
+        buttons.append([btn("بچی ثبت نشده","noop")])
+    buttons.append([btn("🔙 انبار حرفه‌ای","admin:inventory")])
+    return kb(buttons)
+
+def batch_text(row):
+    conn=db()
+    counts=conn.execute("SELECT status,COUNT(*) n FROM product_codes WHERE batch_id=? GROUP BY status",(row["id"],)).fetchall()
+    conn.close()
+    c={r["status"]:r["n"] for r in counts}
+    return f"""🗂 <b>بچ موجودی</b>
+
+ID: <code>{row['id']}</code>
+کد بچ: <code>{html_escape(row['batch_code'])}</code>
+محصول: <b>{html_escape(row['product_title'] or '-')}</b>
+تأمین‌کننده: {html_escape(row['supplier_name'] or '-')}
+عنوان: {html_escape(row['title'] or '-')}
+تعداد: <b>{row['quantity']}</b>
+آماده: <b>{c.get('available',0)}</b>
+مصرف‌شده: <b>{c.get('used',0)}</b>
+منقضی: <b>{c.get('expired',0)}</b>
+غیرفعال: <b>{c.get('disabled',0)}</b>
+قیمت خرید واحد: <b>{money(row['unit_cost'])}</b> تومان
+انقضا: {html_escape(row['expires_at'] or '-')}
+وضعیت: <code>{html_escape(row['status'])}</code>
+
+یادداشت:
+{html_escape(row['note'] or '-')}
+"""
+
+def batch_menu(batch_id):
+    return kb([
+        [btn("📋 نمایش کدهای آماده",f"admin:batch_codes:{batch_id}")],
+        [btn("🔒 غیرفعال‌کردن کدهای آماده",f"admin:batch_disable_confirm:{batch_id}")],
+        [btn("📤 خروجی بچ CSV",f"admin:batch_export:{batch_id}")],
+        [btn("🔙 بچ‌ها","admin:batches")]
+    ])
+
+def inventory_movements_text():
+    conn=db()
+    rows=conn.execute("""SELECT m.*,p.title product_title
+                         FROM voucher_stock_movements m
+                         LEFT JOIN products p ON p.id=m.product_id
+                         ORDER BY m.id DESC LIMIT 60""").fetchall()
+    conn.close()
+    if not rows:
+        return "📜 گردش موجودی ثبت نشده است."
+    lines=["📜 <b>آخرین گردش‌های موجودی</b>\n"]
+    for r in rows:
+        lines.append(f"#{r['id']} | {html_escape(r['movement_type'])} | {html_escape(r['product_title'] or '-')} | qty:{r['quantity']} | {html_escape(r['created_at'])}\n<code>{html_escape(r['note'] or '-')}</code>")
+    return "\n\n".join(lines)
+
+def inventory_low_stock_text():
+    normalize_stock_statuses()
+    conn=db()
+    rows=conn.execute("""SELECT p.*,
+                         (SELECT COUNT(*) FROM product_codes pc
+                          WHERE pc.product_id=p.id AND pc.status='available') available_count
+                         FROM products p
+                         WHERE p.stock_mode='code'
+                         ORDER BY available_count ASC,p.id DESC""").fetchall()
+    conn.close()
+    lines=["⚠️ <b>وضعیت موجودی محصولات</b>\n"]
+    for p in rows:
+        low=int(p["available_count"]) <= int(p["low_stock_threshold"] or 0)
+        lines.append(f"{'🔴' if low else '🟢'} #{p['id']} {html_escape(p['title'])} | موجود:{p['available_count']} | حد:{p['low_stock_threshold']}")
+    return "\n".join(lines)
+
+def inventory_expired_text():
+    normalize_stock_statuses()
+    conn=db()
+    rows=conn.execute("""SELECT pc.*,p.title product_title
+                         FROM product_codes pc LEFT JOIN products p ON p.id=pc.product_id
+                         WHERE pc.status='expired' ORDER BY pc.id DESC LIMIT 60""").fetchall()
+    conn.close()
+    if not rows:
+        return "⏳ کد منقضی وجود ندارد."
+    lines=["⏳ <b>کدهای منقضی</b>\n"]
+    for r in rows:
+        lines.append(f"#{r['id']} | {html_escape(r['product_title'] or '-')} | {html_escape(r['expires_at'] or '-')}")
+    return "\n".join(lines)
+
+def import_inventory_batch(product_id,supplier_id,title,unit_cost,expires_at,note,codes,admin_id):
+    unique_lines=[]
+    seen=set()
+    for raw in codes:
+        value=str(raw).strip()
+        if value and value not in seen:
+            seen.add(value)
+            unique_lines.append(value)
+    if not unique_lines:
+        raise RuntimeError("هیچ کد معتبری ارسال نشده است.")
+
+    conn=db()
+    batch_code=make_batch_code()
+    conn.execute("""INSERT INTO voucher_stock_batches(
+                    batch_code,product_id,supplier_id,title,quantity,unit_cost,
+                    currency,expires_at,note,status,created_by,created_at,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (batch_code,product_id,supplier_id,title,len(unique_lines),unit_cost,
+                  "IRT",expires_at,note,"open",admin_id,now(),now()))
+    batch_id=conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+    inserted=duplicates=0
+    for code_text in unique_lines:
+        checksum=code_checksum(product_id,code_text)
+        exists=conn.execute("""SELECT id FROM product_codes
+                               WHERE product_id=? AND (checksum=? OR code_text=?) LIMIT 1""",
+                            (product_id,checksum,code_text)).fetchone()
+        if exists:
+            duplicates+=1
+            continue
+        conn.execute("""INSERT INTO product_codes(
+                        product_id,code_text,status,order_id,used_by,created_at,used_at,
+                        batch_id,supplier_id,unit_cost,expires_at,note,reserved_at,
+                        checksum,updated_at
+                      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     (product_id,code_text,"available",0,0,now(),"",batch_id,supplier_id,
+                      unit_cost,expires_at,note,"",checksum,now()))
+        inserted+=1
+    conn.execute("UPDATE voucher_stock_batches SET quantity=?,updated_at=? WHERE id=?",(inserted,now(),batch_id))
+    inventory_movement(product_id,"batch_import",inserted,batch_id=batch_id,
+                       reference_type="batch",reference_id=batch_id,
+                       note=f"duplicates={duplicates}",admin_id=admin_id,conn=conn)
+    conn.commit(); conn.close()
+    return batch_id,batch_code,inserted,duplicates
+
 # -------------------- Stock / Reports Helpers --------------------
 
 def product_stock_counts(product_id):
@@ -3330,14 +3679,26 @@ def product_stock_counts(product_id):
     return available, used
 
 def take_product_code(conn, product_id, order_id, user_id):
-    row = conn.execute("""SELECT * FROM product_codes
-                          WHERE product_id=? AND status='available'
-                          ORDER BY id ASC LIMIT 1""", (product_id,)).fetchone()
+    rows = conn.execute("""SELECT * FROM product_codes
+                           WHERE product_id=? AND status='available'
+                           ORDER BY CASE WHEN expires_at='' THEN 1 ELSE 0 END,
+                                    expires_at ASC,id ASC LIMIT 20""",(product_id,)).fetchall()
+    row=None
+    for candidate in rows:
+        if stock_code_is_expired(candidate):
+            conn.execute("UPDATE product_codes SET status='expired',updated_at=? WHERE id=?",(now(),candidate["id"]))
+        else:
+            row=candidate
+            break
     if not row:
         return ""
-    conn.execute("""UPDATE product_codes
-                    SET status='used', order_id=?, used_by=?, used_at=?
-                    WHERE id=?""", (order_id, user_id, now(), row["id"]))
+    conn.execute("""UPDATE product_codes SET status='used',order_id=?,used_by=?,
+                    used_at=?,updated_at=? WHERE id=? AND status='available'""",
+                 (order_id,user_id,now(),now(),row["id"]))
+    inventory_movement(product_id,"code_delivery",-1,code_id=row["id"],
+                       batch_id=row["batch_id"] if "batch_id" in row.keys() else 0,
+                       reference_type="order",reference_id=order_id,
+                       note="automatic voucher delivery",conn=conn)
     return row["code_text"]
 
 def admin_stock_menu():
@@ -3358,26 +3719,36 @@ def admin_stock_menu():
     return kb(buttons)
 
 def render_stock_product(p):
-    available, used = product_stock_counts(p["id"])
-    return f"""🔑 <b>مدیریت موجودی کد</b>
+    counts=inventory_counts(p["id"])
+    cost=inventory_total_cost(p["id"],True)
+    return f"""🔑 <b>مدیریت موجودی ووچر</b>
 
 محصول: <b>{html_escape(p['title'])}</b>
 ID: <code>{p['id']}</code>
 حالت موجودی: <code>{p['stock_mode']}</code>
 
-کدهای آماده تحویل: <b>{available}</b>
-کدهای مصرف‌شده: <b>{used}</b>
+آماده: <b>{counts['available']}</b>
+رزرو: <b>{counts['reserved']}</b>
+مصرف‌شده: <b>{counts['used']}</b>
+منقضی: <b>{counts['expired']}</b>
+غیرفعال: <b>{counts['disabled']}</b>
 
-برای تحویل خودکار، حالت موجودی محصول را روی <code>unlimited</code> نگذار؛ در این پارت حالت <code>code</code> اضافه شده و از کدهای واردشده تحویل می‌دهد.
+ارزش خرید موجودی آماده:
+<b>{money(cost)}</b> تومان
+
+حد هشدار: <b>{p['low_stock_threshold']}</b>
+هشدار: {'فعال ✅' if p['stock_alert_enabled'] else 'غیرفعال ❌'}
 """
 
 def admin_stock_product_menu(product_id):
     return kb([
-        [btn("➕ ایمپورت کدها", f"admin:stock_import:{product_id}")],
-        [btn("📋 نمایش چند کد آماده", f"admin:stock_preview:{product_id}")],
-        [btn("🧹 حذف کدهای آماده", f"admin:stock_clear_available:{product_id}")],
-        [btn("🏷 تنظیم حالت code", f"admin:prod_stockmode_set:{product_id}:code")],
-        [btn("🔙 موجودی کدها", "admin:stock")]
+        [btn("📥 ورود بچ حرفه‌ای",f"admin:batch_start:{product_id}")],
+        [btn("➕ ورود سریع کدها",f"admin:stock_import:{product_id}")],
+        [btn("📋 نمایش کدهای آماده",f"admin:stock_preview:{product_id}")],
+        [btn("⚠️ حد هشدار",f"admin:stock_threshold:{product_id}"),btn("🔔 هشدار روشن/خاموش",f"admin:stock_alert_toggle:{product_id}")],
+        [btn("🧹 حذف کدهای آماده",f"admin:stock_clear_available:{product_id}")],
+        [btn("🏷 تنظیم حالت code",f"admin:prod_stockmode_set:{product_id}:code")],
+        [btn("🔙 موجودی کدها","admin:stock")]
     ])
 
 def render_sales_report():
@@ -4464,6 +4835,160 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:payments": return show_payments(chat_id,message_id)
     if data=="admin:payments_pending": return show_payments(chat_id,message_id,"pending")
 
+    if data=="admin:inventory":
+        return edit_message(chat_id,message_id,inventory_dashboard_text(),inventory_dashboard_menu())
+
+    if data=="admin:suppliers":
+        return edit_message(chat_id,message_id,"🏭 <b>تأمین‌کننده‌ها</b>",suppliers_menu())
+
+    if data=="admin:supplier_add":
+        set_state(tg_id,"supplier_add_name")
+        return edit_message(chat_id,message_id,"نام تأمین‌کننده را ارسال کن:",admin_back())
+
+    if data.startswith("admin:supplier:"):
+        supplier_id=safe_int(data.split(":")[2],0)
+        conn=db(); row=conn.execute("SELECT * FROM voucher_suppliers WHERE id=?",(supplier_id,)).fetchone(); conn.close()
+        if not row:
+            return edit_message(chat_id,message_id,"تأمین‌کننده پیدا نشد.",suppliers_menu())
+        return edit_message(chat_id,message_id,supplier_text(row),supplier_menu(supplier_id))
+
+    for prefix,state,prompt in [
+        ("admin:supplier_name:","supplier_name","نام جدید را ارسال کن:"),
+        ("admin:supplier_contact:","supplier_contact","اطلاعات تماس را ارسال کن:"),
+        ("admin:supplier_note:","supplier_note","یادداشت را ارسال کن:")
+    ]:
+        if data.startswith(prefix):
+            supplier_id=safe_int(data.split(":")[2],0)
+            set_state(tg_id,state,{"supplier_id":supplier_id})
+            return edit_message(chat_id,message_id,prompt,admin_back())
+
+    if data.startswith("admin:supplier_toggle:"):
+        supplier_id=safe_int(data.split(":")[2],0)
+        conn=db(); conn.execute("""UPDATE voucher_suppliers SET
+                                  is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END,
+                                  updated_at=? WHERE id=?""",(now(),supplier_id))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ وضعیت تغییر کرد.",suppliers_menu())
+
+    if data.startswith("admin:supplier_delete_confirm:"):
+        supplier_id=safe_int(data.split(":")[2],0)
+        return edit_message(chat_id,message_id,"آیا تأمین‌کننده حذف شود؟",kb([
+            [btn("✅ حذف",f"admin:supplier_delete:{supplier_id}")],
+            [btn("❌ انصراف",f"admin:supplier:{supplier_id}")]
+        ]))
+
+    if data.startswith("admin:supplier_delete:"):
+        supplier_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        used=conn.execute("SELECT COUNT(*) n FROM voucher_stock_batches WHERE supplier_id=?",(supplier_id,)).fetchone()["n"]
+        if used:
+            conn.execute("UPDATE voucher_suppliers SET is_active=0,updated_at=? WHERE id=?",(now(),supplier_id))
+        else:
+            conn.execute("DELETE FROM voucher_suppliers WHERE id=?",(supplier_id,))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ انجام شد.",suppliers_menu())
+
+    if data=="admin:batch_product_select":
+        return edit_message(chat_id,message_id,"محصول بچ جدید را انتخاب کن:",batch_product_select_menu())
+
+    if data.startswith("admin:batch_start:"):
+        product_id=safe_int(data.split(":")[2],0)
+        set_state(tg_id,"batch_title",{"product_id":product_id})
+        return edit_message(chat_id,message_id,"عنوان بچ را ارسال کن؛ برای بدون عنوان: -",admin_back())
+
+    if data.startswith("admin:batch_supplier:"):
+        supplier_id=safe_int(data.split(":")[2],0)
+        current=STATE.get(tg_id,{})
+        payload=current.get("data",{})
+        payload["supplier_id"]=supplier_id
+        set_state(tg_id,"batch_unit_cost",payload)
+        return edit_message(chat_id,message_id,"قیمت خرید هر کد را به تومان ارسال کن؛ برای نامشخص: 0",admin_back())
+
+    if data=="admin:batches":
+        return edit_message(chat_id,message_id,"🗂 <b>بچ‌های موجودی</b>",batches_menu())
+
+    if data.startswith("admin:batch:"):
+        batch_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        row=conn.execute("""SELECT b.*,p.title product_title,s.name supplier_name
+                            FROM voucher_stock_batches b
+                            LEFT JOIN products p ON p.id=b.product_id
+                            LEFT JOIN voucher_suppliers s ON s.id=b.supplier_id
+                            WHERE b.id=?""",(batch_id,)).fetchone()
+        conn.close()
+        if not row:
+            return edit_message(chat_id,message_id,"بچ پیدا نشد.",batches_menu())
+        return edit_message(chat_id,message_id,batch_text(row),batch_menu(batch_id))
+
+    if data.startswith("admin:batch_codes:"):
+        batch_id=safe_int(data.split(":")[2],0)
+        conn=db(); rows=conn.execute("""SELECT * FROM product_codes WHERE batch_id=? AND status='available'
+                                       ORDER BY id LIMIT 20""",(batch_id,)).fetchall(); conn.close()
+        lines=["📋 <b>کدهای آماده بچ</b>\n"]
+        for r in rows:
+            lines.append(f"#{r['id']} | <code>{html_escape(r['code_text'])}</code>")
+        if not rows:
+            lines.append("کد آماده‌ای وجود ندارد.")
+        return edit_message(chat_id,message_id,"\n".join(lines),kb([[btn("🔙 بچ",f"admin:batch:{batch_id}")]]))
+
+    if data.startswith("admin:batch_disable_confirm:"):
+        batch_id=safe_int(data.split(":")[2],0)
+        return edit_message(chat_id,message_id,"تمام کدهای آماده این بچ غیرفعال شوند؟",kb([
+            [btn("✅ غیرفعال کن",f"admin:batch_disable:{batch_id}")],
+            [btn("❌ انصراف",f"admin:batch:{batch_id}")]
+        ]))
+
+    if data.startswith("admin:batch_disable:"):
+        batch_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        product=conn.execute("SELECT product_id FROM voucher_stock_batches WHERE id=?",(batch_id,)).fetchone()
+        count=conn.execute("SELECT COUNT(*) n FROM product_codes WHERE batch_id=? AND status='available'",(batch_id,)).fetchone()["n"]
+        conn.execute("UPDATE product_codes SET status='disabled',updated_at=? WHERE batch_id=? AND status='available'",(now(),batch_id))
+        conn.execute("UPDATE voucher_stock_batches SET status='closed',updated_at=? WHERE id=?",(now(),batch_id))
+        if product:
+            inventory_movement(product["product_id"],"batch_disable",-count,batch_id=batch_id,
+                               reference_type="batch",reference_id=batch_id,
+                               note="batch disabled",admin_id=tg_id,conn=conn)
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,f"✅ {count} کد غیرفعال شد.",batches_menu())
+
+    if data.startswith("admin:batch_export:"):
+        batch_id=safe_int(data.split(":")[2],0)
+        content=export_table_csv("product_codes",
+            ["id","product_id","code_text","status","order_id","used_by","unit_cost","expires_at","created_at","used_at"],
+            f"SELECT id,product_id,code_text,status,order_id,used_by,unit_cost,expires_at,created_at,used_at FROM product_codes WHERE batch_id={batch_id} ORDER BY id")
+        send_text_file(chat_id,f"mvlite_batch_{batch_id}_{int(time.time())}.csv",content,"📤 خروجی بچ")
+        return edit_message(chat_id,message_id,"✅ خروجی ارسال شد.",kb([[btn("🔙 بچ",f"admin:batch:{batch_id}")]]))
+
+    if data=="admin:inventory_low":
+        return edit_message(chat_id,message_id,inventory_low_stock_text(),kb([[btn("🔙 انبار حرفه‌ای","admin:inventory")]]))
+
+    if data=="admin:inventory_expired":
+        return edit_message(chat_id,message_id,inventory_expired_text(),kb([[btn("🔙 انبار حرفه‌ای","admin:inventory")]]))
+
+    if data=="admin:inventory_movements":
+        return edit_message(chat_id,message_id,inventory_movements_text(),kb([[btn("🔙 انبار حرفه‌ای","admin:inventory")]]))
+
+    if data=="admin:inventory_export":
+        content=export_table_csv("product_codes",
+            ["id","product_id","code_text","status","order_id","used_by","batch_id","supplier_id","unit_cost","expires_at","created_at","used_at"],
+            "SELECT id,product_id,code_text,status,order_id,used_by,batch_id,supplier_id,unit_cost,expires_at,created_at,used_at FROM product_codes ORDER BY id DESC")
+        send_text_file(chat_id,f"mvlite_inventory_{int(time.time())}.csv",content,"📤 خروجی کامل موجودی")
+        return edit_message(chat_id,message_id,"✅ خروجی موجودی ارسال شد.",inventory_dashboard_menu())
+
+    if data.startswith("admin:stock_threshold:"):
+        product_id=safe_int(data.split(":")[2],0)
+        set_state(tg_id,"stock_threshold",{"product_id":product_id})
+        return edit_message(chat_id,message_id,"حد هشدار موجودی را عددی ارسال کن:",admin_back())
+
+    if data.startswith("admin:stock_alert_toggle:"):
+        product_id=safe_int(data.split(":")[2],0)
+        conn=db(); conn.execute("""UPDATE products SET stock_alert_enabled=
+                                  CASE WHEN stock_alert_enabled=1 THEN 0 ELSE 1 END
+                                  WHERE id=?""",(product_id,))
+        conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ وضعیت هشدار تغییر کرد.",admin_stock_product_menu(product_id))
+
     if data=="admin:stock":
         return edit_message(chat_id,message_id,"🔑 <b>مدیریت موجودی کدها</b>",admin_stock_menu())
 
@@ -5252,6 +5777,70 @@ def handle_state_message(chat_id,tg_id,text,message=None):
             set_setting("mute_seconds",str(max(5,safe_int(only_digits(text),60))))
             send_message(chat_id,"✅ مدت mute تغییر کرد.",security_settings_menu()); return True
 
+        if name=="supplier_add_name":
+            conn=db(); conn.execute("""INSERT INTO voucher_suppliers(name,contact,note,is_active,created_at,updated_at)
+                                       VALUES(?,?,?,?,?,?)""",(text.strip(),"","",1,now(),now()))
+            conn.commit(); conn.close()
+            send_message(chat_id,"✅ تأمین‌کننده اضافه شد.",suppliers_menu()); return True
+
+        if name in ("supplier_name","supplier_contact","supplier_note"):
+            supplier_id=data["supplier_id"]
+            field={"supplier_name":"name","supplier_contact":"contact","supplier_note":"note"}[name]
+            conn=db(); conn.execute(f"UPDATE voucher_suppliers SET {field}=?,updated_at=? WHERE id=?",
+                                   (text.strip(),now(),supplier_id))
+            conn.commit(); conn.close()
+            send_message(chat_id,"✅ ذخیره شد.",suppliers_menu()); return True
+
+        if name=="stock_threshold":
+            product_id=data["product_id"]
+            value=max(0,min(100000,safe_int(only_digits(text),5)))
+            conn=db(); conn.execute("UPDATE products SET low_stock_threshold=? WHERE id=?",(value,product_id))
+            conn.commit(); conn.close()
+            send_message(chat_id,f"✅ حد هشدار روی {value} تنظیم شد.",admin_stock_product_menu(product_id)); return True
+
+        if name=="batch_title":
+            data["title"]="" if text.strip()=="-" else text.strip()
+            set_state(tg_id,"batch_supplier",data)
+            conn=db(); rows=conn.execute("SELECT * FROM voucher_suppliers WHERE is_active=1 ORDER BY id DESC LIMIT 40").fetchall(); conn.close()
+            buttons=[[btn("بدون تأمین‌کننده","admin:batch_supplier:0")]]
+            for r in rows:
+                buttons.append([btn(f"#{r['id']} {r['name']}",f"admin:batch_supplier:{r['id']}")])
+            send_message(chat_id,"تأمین‌کننده را انتخاب کن:",kb(buttons)); return True
+
+        if name=="batch_unit_cost":
+            data["unit_cost"]=max(0,safe_int(only_digits(text),0))
+            set_state(tg_id,"batch_expiry",data)
+            send_message(chat_id,"تاریخ انقضا YYYY-MM-DD؛ برای بدون انقضا: -",admin_back()); return True
+
+        if name=="batch_expiry":
+            value=text.strip()
+            if value=="-":
+                value=""
+            elif not re.fullmatch(r"\d{4}-\d{2}-\d{2}",value):
+                send_message(chat_id,"❌ قالب تاریخ نادرست است. نمونه: 2027-12-31",admin_back()); return True
+            data["expires_at"]=value
+            set_state(tg_id,"batch_note",data)
+            send_message(chat_id,"یادداشت بچ را ارسال کن؛ برای بدون یادداشت: -",admin_back()); return True
+
+        if name=="batch_note":
+            data["note"]="" if text.strip()=="-" else text.strip()
+            set_state(tg_id,"batch_codes",data)
+            send_message(chat_id,"کدها را خط‌به‌خط ارسال کن. هر خط یک ووچر مستقل:",admin_back()); return True
+
+        if name=="batch_codes":
+            codes=[x.strip() for x in text.splitlines() if x.strip()]
+            try:
+                batch_id,batch_code,inserted,duplicates=import_inventory_batch(
+                    data["product_id"],data.get("supplier_id",0),data.get("title",""),
+                    data.get("unit_cost",0),data.get("expires_at",""),data.get("note",""),
+                    codes,tg_id)
+                send_message(chat_id,
+                    f"✅ بچ ثبت شد.\nکد بچ: <code>{batch_code}</code>\nثبت‌شده: <b>{inserted}</b>\nتکراری: <b>{duplicates}</b>",
+                    kb([[btn("مشاهده بچ",f"admin:batch:{batch_id}")],[btn("🔙 انبار","admin:inventory")]]))
+            except Exception as e:
+                send_message(chat_id,f"❌ خطا:\n<code>{html_escape(repr(e))}</code>",inventory_dashboard_menu())
+            return True
+
         if name=="stock_import":
             product_id=data["product_id"]
             lines=[ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -5429,6 +6018,10 @@ def handle_message(message):
             conn.execute("UPDATE users SET is_admin=1 WHERE tg_id=?",(tg_id,)); conn.commit(); conn.close()
             return send_message(chat_id,"✅ شما ادمین شدید.\nحالا /admin را بزنید.")
         conn.close(); return send_message(chat_id,"❌ ادمین قبلاً ثبت شده است.")
+    if text=="/inventory":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,inventory_dashboard_text(),inventory_dashboard_menu())
+
     if text=="/admin":
         if not is_admin(tg_id): return send_message(chat_id,"❌ شما ادمین نیستید.\nاگر اولین اجراست، /claim_admin را بزنید.")
         clear_state(tg_id); return send_message(chat_id,render_admin_home(),admin_menu())
