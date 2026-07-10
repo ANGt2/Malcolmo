@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-MVLite - Part 03 Wallet / Payments / Receipts
+MVLite Release 1.0
 Standalone Telegram bot without external packages.
 
 Part 03 adds:
