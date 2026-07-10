@@ -47,6 +47,9 @@ Part 03 adds:
 - generic price API manager
 - admin API credentials/configuration
 - API connection test
+- generic JSON symbols mapper
+- symbols and live prices synchronization
+- admin symbols list/search/pagination
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io
@@ -370,6 +373,21 @@ def init_db():
         created_at TEXT NOT NULL
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS api_symbols (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_name TEXT DEFAULT '',
+        external_id TEXT DEFAULT '',
+        symbol TEXT NOT NULL,
+        display_name TEXT DEFAULT '',
+        price REAL DEFAULT 0,
+        quote_currency TEXT DEFAULT '',
+        raw_json TEXT DEFAULT '',
+        is_active INTEGER DEFAULT 1,
+        updated_at TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        UNIQUE(provider_name, symbol)
+    )""")
+
     try:
         c.execute("ALTER TABLE users ADD COLUMN muted_until INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -411,6 +429,19 @@ def init_db():
         "price_api_last_test_status": "never",
         "price_api_last_test_at": "",
         "price_api_last_test_message": "",
+        "price_api_symbols_endpoint": "",
+        "price_api_symbols_method": "GET",
+        "price_api_query_json": "{}",
+        "price_api_body_json": "{}",
+        "price_api_list_path": "",
+        "price_api_symbol_path": "symbol",
+        "price_api_name_path": "name",
+        "price_api_price_path": "price",
+        "price_api_id_path": "id",
+        "price_api_quote_path": "quote",
+        "price_api_last_sync_status": "never",
+        "price_api_last_sync_at": "",
+        "price_api_last_sync_message": "",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
@@ -440,6 +471,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_codes_product_status ON product_codes(product_id,status)",
         "CREATE INDEX IF NOT EXISTS idx_wallet_user ON wallet_transactions(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_security_user ON security_events(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_api_symbols_symbol ON api_symbols(symbol)",
+        "CREATE INDEX IF NOT EXISTS idx_api_symbols_active ON api_symbols(is_active)",
     ]
     for q in indexes:
         c.execute(q)
@@ -930,6 +963,295 @@ def admin_ticket_menu(ticket_id):
 
 
 
+
+# -------------------- Generic JSON Symbols Mapper --------------------
+
+def json_path_get(data, path, default=None):
+    path = str(path or "").strip()
+    if not path:
+        return data
+    current = data
+    for part in path.split("."):
+        if part == "":
+            continue
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except Exception:
+                return default
+        elif isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current[part]
+        else:
+            return default
+    return current
+
+def parse_json_setting(key, default):
+    raw = get_setting(key, "")
+    if not str(raw).strip():
+        return default
+    try:
+        value = json.loads(raw)
+        return value
+    except Exception:
+        return default
+
+def append_query_params(url, params):
+    if not isinstance(params, dict) or not params:
+        return url
+    encoded = urllib.parse.urlencode(params, doseq=True)
+    return f"{url}{'&' if '?' in url else '?'}{encoded}"
+
+def normalize_price_value(value):
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+def fetch_price_api_json():
+    if get_setting("price_api_enabled", "off") != "on":
+        raise RuntimeError("API غیرفعال است.")
+
+    endpoint = get_setting("price_api_symbols_endpoint", "")
+    if not endpoint:
+        raise RuntimeError("Endpoint نمادها ثبت نشده است.")
+
+    method = get_setting("price_api_symbols_method", "GET").upper().strip()
+    if method not in ("GET", "POST"):
+        method = "GET"
+
+    url = build_price_api_url(endpoint)
+    query_params = parse_json_setting("price_api_query_json", {})
+    body_obj = parse_json_setting("price_api_body_json", {})
+    url = append_query_params(url, query_params)
+
+    request_data = None
+    headers = price_api_headers()
+    if method == "POST":
+        request_data = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    timeout = max(3, min(60, safe_int(get_setting("price_api_timeout", "20"), 20)))
+    req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        body = e.read(1200).decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body[:1000]}")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"پاسخ API JSON معتبر نیست: {e}")
+    except Exception as e:
+        raise RuntimeError(repr(e))
+
+def map_api_symbols(payload):
+    list_path = get_setting("price_api_list_path", "")
+    rows = json_path_get(payload, list_path, None)
+    if rows is None:
+        raise RuntimeError("مسیر لیست در پاسخ پیدا نشد.")
+    if isinstance(rows, dict):
+        rows = list(rows.values())
+    if not isinstance(rows, list):
+        raise RuntimeError("خروجی مسیر لیست باید آرایه باشد.")
+
+    symbol_path = get_setting("price_api_symbol_path", "symbol")
+    name_path = get_setting("price_api_name_path", "name")
+    price_path = get_setting("price_api_price_path", "price")
+    id_path = get_setting("price_api_id_path", "id")
+    quote_path = get_setting("price_api_quote_path", "quote")
+
+    mapped = []
+    skipped = 0
+    for item in rows:
+        symbol = json_path_get(item, symbol_path, "")
+        if symbol is None or str(symbol).strip() == "":
+            skipped += 1
+            continue
+        symbol = str(symbol).strip().upper()
+        display_name = json_path_get(item, name_path, "") if name_path else ""
+        external_id = json_path_get(item, id_path, "") if id_path else ""
+        quote_currency = json_path_get(item, quote_path, "") if quote_path else ""
+        price_raw = json_path_get(item, price_path, 0)
+        price = normalize_price_value(price_raw)
+        try:
+            raw_json = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            raw_json = str(item)
+
+        mapped.append({
+            "symbol": symbol,
+            "display_name": str(display_name or ""),
+            "external_id": str(external_id or ""),
+            "quote_currency": str(quote_currency or ""),
+            "price": price,
+            "raw_json": raw_json[:12000],
+        })
+    return mapped, skipped
+
+def sync_api_symbols():
+    payload = fetch_price_api_json()
+    mapped, skipped = map_api_symbols(payload)
+    provider = get_setting("price_api_name", "") or "default"
+    conn = db()
+    inserted = 0
+    updated = 0
+    try:
+        for item in mapped:
+            old = conn.execute(
+                "SELECT id FROM api_symbols WHERE provider_name=? AND symbol=?",
+                (provider, item["symbol"])
+            ).fetchone()
+            conn.execute("""INSERT INTO api_symbols(
+                              provider_name,external_id,symbol,display_name,price,
+                              quote_currency,raw_json,is_active,updated_at,created_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(provider_name,symbol) DO UPDATE SET
+                              external_id=excluded.external_id,
+                              display_name=excluded.display_name,
+                              price=excluded.price,
+                              quote_currency=excluded.quote_currency,
+                              raw_json=excluded.raw_json,
+                              updated_at=excluded.updated_at""",
+                         (provider,item["external_id"],item["symbol"],item["display_name"],
+                          item["price"],item["quote_currency"],item["raw_json"],1,now(),now()))
+            if old:
+                updated += 1
+            else:
+                inserted += 1
+        conn.commit()
+    finally:
+        conn.close()
+
+    message = f"دریافت‌شده: {len(mapped)} | جدید: {inserted} | بروزرسانی: {updated} | ردشده: {skipped}"
+    set_setting("price_api_last_sync_status", "ok")
+    set_setting("price_api_last_sync_at", now())
+    set_setting("price_api_last_sync_message", message)
+    return message
+
+def api_mapper_admin_text():
+    method = get_setting("price_api_symbols_method", "GET")
+    endpoint = get_setting("price_api_symbols_endpoint", "") or "ثبت نشده"
+    query_json = get_setting("price_api_query_json", "{}")
+    body_json = get_setting("price_api_body_json", "{}")
+    list_path = get_setting("price_api_list_path", "") or "(ریشه پاسخ)"
+    symbol_path = get_setting("price_api_symbol_path", "symbol")
+    name_path = get_setting("price_api_name_path", "name")
+    price_path = get_setting("price_api_price_path", "price")
+    id_path = get_setting("price_api_id_path", "id")
+    quote_path = get_setting("price_api_quote_path", "quote")
+    last_status = get_setting("price_api_last_sync_status", "never")
+    last_at = get_setting("price_api_last_sync_at", "") or "-"
+    last_msg = get_setting("price_api_last_sync_message", "") or "-"
+
+    return f"""🧩 <b>تنظیم مپ نمادها و قیمت‌ها</b>
+
+Method: <code>{html_escape(method)}</code>
+Endpoint:
+<code>{html_escape(endpoint)}</code>
+
+Query JSON:
+<code>{html_escape(query_json)}</code>
+
+Body JSON:
+<code>{html_escape(body_json)}</code>
+
+مسیر لیست: <code>{html_escape(list_path)}</code>
+مسیر نماد: <code>{html_escape(symbol_path)}</code>
+مسیر نام: <code>{html_escape(name_path)}</code>
+مسیر قیمت: <code>{html_escape(price_path)}</code>
+مسیر شناسه: <code>{html_escape(id_path)}</code>
+مسیر ارز مقابل: <code>{html_escape(quote_path)}</code>
+
+آخرین همگام‌سازی: <b>{html_escape(last_status)}</b>
+زمان: {html_escape(last_at)}
+نتیجه:
+<code>{html_escape(last_msg)}</code>
+"""
+
+def api_mapper_admin_menu():
+    return kb([
+        [btn("🌐 Endpoint نمادها", "admin:api_map_endpoint"), btn("🔁 GET/POST", "admin:api_map_method")],
+        [btn("🔎 Query JSON", "admin:api_map_query"), btn("📦 Body JSON", "admin:api_map_body")],
+        [btn("📚 مسیر لیست", "admin:api_map_list"), btn("🏷 مسیر نماد", "admin:api_map_symbol")],
+        [btn("📝 مسیر نام", "admin:api_map_name"), btn("💰 مسیر قیمت", "admin:api_map_price")],
+        [btn("🆔 مسیر شناسه", "admin:api_map_id"), btn("💱 مسیر Quote", "admin:api_map_quote")],
+        [btn("🧪 تست و پیش‌نمایش", "admin:api_map_preview")],
+        [btn("🔄 دریافت و ذخیره نمادها", "admin:api_symbols_sync")],
+        [btn("💱 لیست نمادها", "admin:api_symbols:0")],
+        [btn("🔙 مدیریت API", "admin:price_api")]
+    ])
+
+def api_symbols_list_text(page=0, query=""):
+    page = max(0, int(page))
+    page_size = 12
+    offset = page * page_size
+    conn = db()
+    if query:
+        like = f"%{query}%"
+        total = conn.execute("""SELECT COUNT(*) n FROM api_symbols
+                                WHERE symbol LIKE ? OR display_name LIKE ?""", (like,like)).fetchone()["n"]
+        rows = conn.execute("""SELECT * FROM api_symbols
+                               WHERE symbol LIKE ? OR display_name LIKE ?
+                               ORDER BY symbol ASC LIMIT ? OFFSET ?""",
+                            (like,like,page_size,offset)).fetchall()
+    else:
+        total = conn.execute("SELECT COUNT(*) n FROM api_symbols").fetchone()["n"]
+        rows = conn.execute("""SELECT * FROM api_symbols
+                               ORDER BY symbol ASC LIMIT ? OFFSET ?""",
+                            (page_size,offset)).fetchall()
+    conn.close()
+
+    lines = [f"💱 <b>نمادهای API</b>\nتعداد کل: <b>{total}</b> | صفحه: <b>{page+1}</b>\n"]
+    buttons = []
+    for row in rows:
+        price_text = f"{row['price']:,.8f}".rstrip("0").rstrip(".")
+        status = "✅" if row["is_active"] else "❌"
+        lines.append(f"{status} <b>{html_escape(row['symbol'])}</b> | {html_escape(row['display_name'] or '-')} | <code>{price_text}</code> {html_escape(row['quote_currency'] or '')}")
+        buttons.append([btn(f"{status} {row['symbol']} | {price_text}", f"admin:api_symbol:{row['id']}")])
+
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️ قبلی", f"admin:api_symbols:{page-1}"))
+    if offset + page_size < total:
+        nav.append(btn("بعدی ➡️", f"admin:api_symbols:{page+1}"))
+    if nav:
+        buttons.append(nav)
+    buttons.append([btn("🔍 جستجوی نماد", "admin:api_symbols_search")])
+    buttons.append([btn("🔄 بروزرسانی", "admin:api_symbols_sync"), btn("🔙 مپ API", "admin:api_mapper")])
+    return "\n".join(lines), kb(buttons)
+
+def api_symbol_detail_text(row):
+    price_text = f"{row['price']:,.12f}".rstrip("0").rstrip(".")
+    return f"""💱 <b>جزئیات نماد</b>
+
+ID داخلی: <code>{row['id']}</code>
+Provider: {html_escape(row['provider_name'] or '-')}
+External ID: <code>{html_escape(row['external_id'] or '-')}</code>
+نماد: <b>{html_escape(row['symbol'])}</b>
+نام: {html_escape(row['display_name'] or '-')}
+قیمت: <code>{price_text}</code>
+Quote: {html_escape(row['quote_currency'] or '-')}
+وضعیت: {'فعال ✅' if row['is_active'] else 'غیرفعال ❌'}
+آخرین بروزرسانی: {html_escape(row['updated_at'] or '-')}
+"""
+
+def api_symbol_detail_menu(symbol_id):
+    return kb([
+        [btn("🔁 فعال/غیرفعال", f"admin:api_symbol_toggle:{symbol_id}")],
+        [btn("📄 نمایش Raw JSON", f"admin:api_symbol_raw:{symbol_id}")],
+        [btn("🔙 لیست نمادها", "admin:api_symbols:0")]
+    ])
+
 # -------------------- Generic Price API Manager --------------------
 
 def mask_secret(value):
@@ -1027,6 +1349,8 @@ def price_api_admin_menu():
         [btn("🧾 Auth Header", "admin:price_api_set_header"), btn("🏷 Auth Prefix", "admin:price_api_set_prefix")],
         [btn("🧪 Test Endpoint", "admin:price_api_set_test_endpoint"), btn("⏱ Timeout", "admin:price_api_set_timeout")],
         [btn("🔍 تست اتصال", "admin:price_api_test")],
+        [btn("🧩 تنظیم نمادها و قیمت‌ها", "admin:api_mapper")],
+        [btn("💱 لیست نمادها", "admin:api_symbols:0")],
         [btn("🗑 حذف API Key", "admin:price_api_clear_key")],
         [btn("🔙 پنل ادمین", "admin:home")]
     ])
@@ -2010,6 +2334,85 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
+    if data=="admin:api_mapper":
+        return edit_message(chat_id,message_id,api_mapper_admin_text(),api_mapper_admin_menu())
+
+    if data=="admin:api_map_method":
+        current=get_setting("price_api_symbols_method","GET").upper()
+        set_setting("price_api_symbols_method","POST" if current=="GET" else "GET")
+        return edit_message(chat_id,message_id,api_mapper_admin_text(),api_mapper_admin_menu())
+
+    if data=="admin:api_map_preview":
+        try:
+            payload=fetch_price_api_json()
+            mapped, skipped=map_api_symbols(payload)
+            preview=mapped[:5]
+            lines=[f"✅ ساختار پاسخ معتبر است.\n\nتعداد قابل‌خواندن: <b>{len(mapped)}</b>\nردشده: <b>{skipped}</b>\n"]
+            for item in preview:
+                lines.append(f"• <b>{html_escape(item['symbol'])}</b> | {html_escape(item['display_name'] or '-')} | <code>{item['price']}</code>")
+            if not preview:
+                lines.append("هیچ نمادی با مسیرهای فعلی استخراج نشد.")
+            return edit_message(chat_id,message_id,"\n".join(lines),kb([[btn("🔙 تنظیم مپ","admin:api_mapper")]]))
+        except Exception as e:
+            return edit_message(chat_id,message_id,f"❌ تست ساختار ناموفق بود:\n<code>{html_escape(repr(e))[:2600]}</code>",kb([[btn("🔙 تنظیم مپ","admin:api_mapper")]]))
+
+    if data=="admin:api_symbols_sync":
+        try:
+            result=sync_api_symbols()
+            log_admin(tg_id,"api_symbols_sync",result)
+            return edit_message(chat_id,message_id,f"✅ همگام‌سازی انجام شد.\n\n{html_escape(result)}",kb([[btn("💱 مشاهده نمادها","admin:api_symbols:0")],[btn("🔙 تنظیم مپ","admin:api_mapper")]]))
+        except Exception as e:
+            set_setting("price_api_last_sync_status","failed")
+            set_setting("price_api_last_sync_at",now())
+            set_setting("price_api_last_sync_message",repr(e))
+            return edit_message(chat_id,message_id,f"❌ همگام‌سازی ناموفق بود:\n<code>{html_escape(repr(e))[:2600]}</code>",kb([[btn("🔙 تنظیم مپ","admin:api_mapper")]]))
+
+    if data.startswith("admin:api_symbols:"):
+        page=safe_int(data.split(":")[2],0)
+        text_out, markup=api_symbols_list_text(page)
+        return edit_message(chat_id,message_id,text_out,markup)
+
+    if data=="admin:api_symbols_search":
+        set_state(tg_id,"api_symbols_search")
+        return edit_message(chat_id,message_id,"نام یا نماد موردنظر را ارسال کن:",kb([[btn("🔙 لیست نمادها","admin:api_symbols:0")]]))
+
+    if data.startswith("admin:api_symbol:"):
+        symbol_id=safe_int(data.split(":")[2],0)
+        conn=db(); row=conn.execute("SELECT * FROM api_symbols WHERE id=?",(symbol_id,)).fetchone(); conn.close()
+        if not row:
+            return edit_message(chat_id,message_id,"نماد پیدا نشد.",kb([[btn("🔙 لیست نمادها","admin:api_symbols:0")]]))
+        return edit_message(chat_id,message_id,api_symbol_detail_text(row),api_symbol_detail_menu(symbol_id))
+
+    if data.startswith("admin:api_symbol_toggle:"):
+        symbol_id=safe_int(data.split(":")[2],0)
+        conn=db()
+        conn.execute("UPDATE api_symbols SET is_active=CASE WHEN is_active=1 THEN 0 ELSE 1 END WHERE id=?",(symbol_id,))
+        conn.commit()
+        row=conn.execute("SELECT * FROM api_symbols WHERE id=?",(symbol_id,)).fetchone()
+        conn.close()
+        return edit_message(chat_id,message_id,api_symbol_detail_text(row),api_symbol_detail_menu(symbol_id))
+
+    if data.startswith("admin:api_symbol_raw:"):
+        symbol_id=safe_int(data.split(":")[2],0)
+        conn=db(); row=conn.execute("SELECT raw_json FROM api_symbols WHERE id=?",(symbol_id,)).fetchone(); conn.close()
+        raw=row["raw_json"] if row else ""
+        return edit_message(chat_id,message_id,f"📄 <b>Raw JSON</b>\n\n<code>{html_escape(raw)[:3500]}</code>",kb([[btn("🔙 جزئیات نماد",f"admin:api_symbol:{symbol_id}")]]))
+
+    for cb,state,prompt in [
+        ("admin:api_map_endpoint","api_map_endpoint","Endpoint لیست نمادها را ارسال کن.\nمثال: /v1/markets"),
+        ("admin:api_map_query","api_map_query","Query Params را به صورت JSON ارسال کن.\nمثال: {\"limit\":100}\nبرای خالی: {}"),
+        ("admin:api_map_body","api_map_body","Body را به صورت JSON ارسال کن.\nمثال: {\"market\":\"spot\"}\nبرای خالی: {}"),
+        ("admin:api_map_list","api_map_list","مسیر آرایه نمادها را ارسال کن.\nمثال: data.items\nاگر آرایه در ریشه است علامت - را بفرست."),
+        ("admin:api_map_symbol","api_map_symbol","مسیر فیلد نماد را ارسال کن.\nمثال: symbol یا market.code"),
+        ("admin:api_map_name","api_map_name","مسیر فیلد نام را ارسال کن.\nمثال: name\nبرای نداشتن: -"),
+        ("admin:api_map_price","api_map_price","مسیر فیلد قیمت را ارسال کن.\nمثال: price یا ticker.last"),
+        ("admin:api_map_id","api_map_id","مسیر شناسه خارجی را ارسال کن.\nمثال: id\nبرای نداشتن: -"),
+        ("admin:api_map_quote","api_map_quote","مسیر ارز مقابل را ارسال کن.\nمثال: quote\nبرای نداشتن: -")
+    ]:
+        if data==cb:
+            set_state(tg_id,state)
+            return edit_message(chat_id,message_id,prompt,admin_back())
+
     if data=="admin:price_api_toggle":
         current=get_setting("price_api_enabled","off")
         set_setting("price_api_enabled","off" if current=="on" else "on")
@@ -2741,6 +3144,56 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="api_symbols_search":
+            query=text.strip()
+            conn=db()
+            like=f"%{query}%"
+            rows=conn.execute("""SELECT * FROM api_symbols
+                                 WHERE symbol LIKE ? OR display_name LIKE ?
+                                 ORDER BY symbol ASC LIMIT 20""",(like,like)).fetchall()
+            conn.close()
+            if not rows:
+                send_message(chat_id,"🔍 نمادی پیدا نشد.",kb([[btn("🔙 لیست نمادها","admin:api_symbols:0")]])); return True
+            lines=[f"🔍 <b>نتایج جستجو:</b> {html_escape(query)}\n"]
+            buttons=[]
+            for row in rows:
+                price_text=f"{row['price']:,.8f}".rstrip("0").rstrip(".")
+                lines.append(f"• <b>{html_escape(row['symbol'])}</b> | <code>{price_text}</code>")
+                buttons.append([btn(f"{row['symbol']} | {price_text}",f"admin:api_symbol:{row['id']}")])
+            buttons.append([btn("🔙 لیست نمادها","admin:api_symbols:0")])
+            send_message(chat_id,"\n".join(lines),kb(buttons)); return True
+
+        if name=="api_map_endpoint":
+            set_setting("price_api_symbols_endpoint",text.strip())
+            send_message(chat_id,"✅ Endpoint ذخیره شد.",api_mapper_admin_menu()); return True
+
+        if name in ("api_map_query","api_map_body"):
+            try:
+                obj=json.loads(text.strip())
+                if not isinstance(obj,dict):
+                    raise ValueError("JSON باید object باشد")
+                normalized=json.dumps(obj,ensure_ascii=False,separators=(",",":"))
+            except Exception as e:
+                send_message(chat_id,f"❌ JSON نامعتبر است:\n<code>{html_escape(repr(e))}</code>",api_mapper_admin_menu()); return True
+            key="price_api_query_json" if name=="api_map_query" else "price_api_body_json"
+            set_setting(key,normalized)
+            send_message(chat_id,"✅ JSON ذخیره شد.",api_mapper_admin_menu()); return True
+
+        if name in ("api_map_list","api_map_symbol","api_map_name","api_map_price","api_map_id","api_map_quote"):
+            value=text.strip()
+            if value=="-":
+                value=""
+            key_map={
+                "api_map_list":"price_api_list_path",
+                "api_map_symbol":"price_api_symbol_path",
+                "api_map_name":"price_api_name_path",
+                "api_map_price":"price_api_price_path",
+                "api_map_id":"price_api_id_path",
+                "api_map_quote":"price_api_quote_path",
+            }
+            set_setting(key_map[name],value)
+            send_message(chat_id,"✅ مسیر ذخیره شد.",api_mapper_admin_menu()); return True
+
         if name=="price_api_set_name":
             set_setting("price_api_name",text.strip()); log_admin(tg_id,"price_api_set_name",text.strip())
             send_message(chat_id,"✅ نام API ذخیره شد.",price_api_admin_menu()); return True
@@ -3011,6 +3464,10 @@ def handle_message(message):
     if text=="/priceapi":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,price_api_admin_text(),price_api_admin_menu())
+    if text=="/symbols":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        text_out, markup=api_symbols_list_text(0)
+        return send_message(chat_id,text_out,markup)
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
