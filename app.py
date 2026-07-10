@@ -2863,7 +2863,7 @@ def handle_callback(callback):
         return edit_message(chat_id,message_id,f"خطا:\n<code>{html_escape(repr(e))}</code>",back_main())
 
 def polling_loop():
-    print("MVLite Part 03 is running...")
+    print(f"{APP_NAME} {APP_VERSION} is running...")
     print("Use /claim_admin for first admin, then /admin")
     offset=0
     while True:
