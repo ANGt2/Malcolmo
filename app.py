@@ -50,6 +50,9 @@ Part 03 adds:
 - generic JSON symbols mapper
 - symbols and live prices synchronization
 - admin symbols list/search/pagination
+- product binding to API symbols
+- online price rules and calculation
+- fixed/online product price modes
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io
@@ -245,6 +248,16 @@ def init_db():
         ("delivery_text", "ALTER TABLE products ADD COLUMN delivery_text TEXT DEFAULT ''"),
         ("min_qty", "ALTER TABLE products ADD COLUMN min_qty INTEGER DEFAULT 1"),
         ("max_qty", "ALTER TABLE products ADD COLUMN max_qty INTEGER DEFAULT 1"),
+        ("price_mode", "ALTER TABLE products ADD COLUMN price_mode TEXT DEFAULT 'fixed'"),
+        ("api_symbol_id", "ALTER TABLE products ADD COLUMN api_symbol_id INTEGER DEFAULT 0"),
+        ("price_multiplier", "ALTER TABLE products ADD COLUMN price_multiplier REAL DEFAULT 1"),
+        ("profit_percent", "ALTER TABLE products ADD COLUMN profit_percent REAL DEFAULT 0"),
+        ("fixed_fee", "ALTER TABLE products ADD COLUMN fixed_fee INTEGER DEFAULT 0"),
+        ("min_price", "ALTER TABLE products ADD COLUMN min_price INTEGER DEFAULT 0"),
+        ("max_price", "ALTER TABLE products ADD COLUMN max_price INTEGER DEFAULT 0"),
+        ("fallback_price", "ALTER TABLE products ADD COLUMN fallback_price INTEGER DEFAULT 0"),
+        ("last_calculated_price", "ALTER TABLE products ADD COLUMN last_calculated_price INTEGER DEFAULT 0"),
+        ("price_updated_at", "ALTER TABLE products ADD COLUMN price_updated_at TEXT DEFAULT ''"),
     ]:
         try: c.execute(ddl)
         except sqlite3.OperationalError: pass
@@ -473,6 +486,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_security_user ON security_events(user_id)",
         "CREATE INDEX IF NOT EXISTS idx_api_symbols_symbol ON api_symbols(symbol)",
         "CREATE INDEX IF NOT EXISTS idx_api_symbols_active ON api_symbols(is_active)",
+        "CREATE INDEX IF NOT EXISTS idx_products_price_mode ON products(price_mode)",
+        "CREATE INDEX IF NOT EXISTS idx_products_api_symbol ON products(api_symbol_id)",
     ]
     for q in indexes:
         c.execute(q)
@@ -688,7 +703,8 @@ def admin_products_menu():
 
 def admin_product_detail_menu(prod_id):
     return kb([
-        [btn("✏️ نام", f"admin:prod_rename:{prod_id}"), btn("💰 قیمت", f"admin:prod_price:{prod_id}")],
+        [btn("✏️ نام", f"admin:prod_rename:{prod_id}"), btn("💰 قیمت ثابت", f"admin:prod_price:{prod_id}")],
+        [btn("🌐 تنظیم قیمت آنلاین", f"admin:prod_price_settings:{prod_id}")],
         [btn("📝 توضیح", f"admin:prod_desc:{prod_id}"), btn("📦 متن موجودی", f"admin:prod_stock:{prod_id}")],
         [btn("🚚 متن تحویل", f"admin:prod_delivery:{prod_id}"), btn("🏷 حالت موجودی", f"admin:prod_stockmode:{prod_id}")],
         [btn("🔢 ترتیب", f"admin:prod_sort:{prod_id}"), btn("📂 تغییر دسته", f"admin:prod_move:{prod_id}")],
@@ -748,6 +764,115 @@ def admin_payment_detail_menu(pay_id):
         [btn("🔙 پرداخت‌ها", "admin:payments")]
     ])
 
+
+# -------------------- Product Online Price Engine --------------------
+
+def product_price_mode(p):
+    try:
+        return (p["price_mode"] or "fixed").lower()
+    except Exception:
+        return "fixed"
+
+def get_bound_api_symbol(conn, p):
+    try:
+        symbol_id = int(p["api_symbol_id"] or 0)
+    except Exception:
+        symbol_id = 0
+    if not symbol_id:
+        return None
+    return conn.execute("SELECT * FROM api_symbols WHERE id=?", (symbol_id,)).fetchone()
+
+def calculate_product_price_from_rows(p, symbol_row=None):
+    mode = product_price_mode(p)
+    if mode != "online":
+        return max(0, int(p["price"] or 0)), "fixed"
+
+    source_price = float(symbol_row["price"] or 0) if symbol_row else 0.0
+    multiplier = float(p["price_multiplier"] or 1)
+    profit_percent = float(p["profit_percent"] or 0)
+    fixed_fee = int(p["fixed_fee"] or 0)
+    fallback = int(p["fallback_price"] or 0)
+    min_price = int(p["min_price"] or 0)
+    max_price = int(p["max_price"] or 0)
+
+    if source_price <= 0:
+        result = fallback
+        source = "fallback"
+    else:
+        base = source_price * multiplier
+        result = round(base + (base * profit_percent / 100.0) + fixed_fee)
+        source = "api"
+
+    result = max(0, int(result))
+    if min_price > 0 and result < min_price:
+        result = min_price
+    if max_price > 0 and result > max_price:
+        result = max_price
+    return result, source
+
+def get_effective_product_price(product_id, persist=True):
+    conn = db()
+    p = conn.execute("SELECT * FROM products WHERE id=?", (product_id,)).fetchone()
+    if not p:
+        conn.close()
+        return 0, "missing", None, None
+    symbol = get_bound_api_symbol(conn, p)
+    amount, source = calculate_product_price_from_rows(p, symbol)
+    if persist and product_price_mode(p) == "online":
+        conn.execute("UPDATE products SET last_calculated_price=?, price_updated_at=? WHERE id=?", (amount, now(), product_id))
+        conn.commit()
+    conn.close()
+    return amount, source, p, symbol
+
+def product_price_summary(p, symbol=None):
+    amount, source = calculate_product_price_from_rows(p, symbol)
+    mode = product_price_mode(p)
+    if mode == "fixed":
+        return f"نوع قیمت: ثابت\nقیمت نهایی: {money(amount)} تومان"
+    symbol_name = symbol["symbol"] if symbol else "انتخاب نشده"
+    symbol_price = symbol["price"] if symbol else 0
+    return f"""نوع قیمت: آنلاین
+نماد متصل: {html_escape(symbol_name)}
+قیمت نماد: <code>{symbol_price}</code>
+ضریب: <code>{p['price_multiplier']}</code>
+سود: <code>{p['profit_percent']}%</code>
+کارمزد ثابت: <code>{money(p['fixed_fee'])}</code> تومان
+حداقل: <code>{money(p['min_price'])}</code> تومان
+حداکثر: <code>{money(p['max_price'])}</code> تومان
+قیمت جایگزین: <code>{money(p['fallback_price'])}</code> تومان
+قیمت نهایی فعلی: <b>{money(amount)}</b> تومان
+منبع: <code>{source}</code>"""
+
+def admin_product_price_menu(prod_id):
+    return kb([
+        [btn("💵 قیمت ثابت", f"admin:prod_price_mode:{prod_id}:fixed"), btn("🌐 قیمت آنلاین", f"admin:prod_price_mode:{prod_id}:online")],
+        [btn("💱 انتخاب نماد", f"admin:prod_symbol_page:{prod_id}:0")],
+        [btn("✖️ ضریب", f"admin:prod_multiplier:{prod_id}"), btn("📈 درصد سود", f"admin:prod_profit:{prod_id}")],
+        [btn("💰 کارمزد ثابت", f"admin:prod_fixed_fee:{prod_id}")],
+        [btn("📉 حداقل قیمت", f"admin:prod_min_price:{prod_id}"), btn("📈 حداکثر قیمت", f"admin:prod_max_price:{prod_id}")],
+        [btn("🛟 قیمت جایگزین", f"admin:prod_fallback:{prod_id}")],
+        [btn("🧮 محاسبه و ذخیره", f"admin:prod_recalc:{prod_id}")],
+        [btn("❌ قطع اتصال نماد", f"admin:prod_symbol_clear:{prod_id}")],
+        [btn("🔙 محصول", f"admin:prod:{prod_id}")]
+    ])
+
+def admin_product_symbol_picker(prod_id, page=0):
+    page=max(0,int(page)); size=12; offset=page*size
+    conn=db()
+    total=conn.execute("SELECT COUNT(*) n FROM api_symbols WHERE is_active=1").fetchone()["n"]
+    rows=conn.execute("SELECT * FROM api_symbols WHERE is_active=1 ORDER BY symbol ASC LIMIT ? OFFSET ?",(size,offset)).fetchall()
+    conn.close()
+    buttons=[]
+    for r in rows:
+        price_text=f"{r['price']:,.8f}".rstrip("0").rstrip(".")
+        buttons.append([btn(f"{r['symbol']} | {price_text}",f"admin:prod_symbol_set:{prod_id}:{r['id']}")])
+    nav=[]
+    if page>0: nav.append(btn("⬅️ قبلی",f"admin:prod_symbol_page:{prod_id}:{page-1}"))
+    if offset+size<total: nav.append(btn("بعدی ➡️",f"admin:prod_symbol_page:{prod_id}:{page+1}"))
+    if nav: buttons.append(nav)
+    buttons.append([btn("🔙 تنظیم قیمت",f"admin:prod_price_settings:{prod_id}")])
+    return f"💱 <b>انتخاب نماد برای محصول #{prod_id}</b>\n\nتعداد نمادهای فعال: <b>{total}</b>\nصفحه: <b>{page+1}</b>",kb(buttons)
+
 # -------------------- Render --------------------
 
 def render_profile(u):
@@ -779,14 +904,18 @@ def render_category(cat):
 """
 
 def render_product(p):
-    price=f"{money(p['price'])} تومان" if p["price"] else "قیمت توافقی"
+    effective_price, price_source, _, symbol = get_effective_product_price(p["id"], persist=True)
+    price=f"{money(effective_price)} تومان" if effective_price else "قیمت توافقی"
     stock=p["stock_text"] or "موجودی/تحویل توسط ادمین تنظیم نشده است."
     mode=p["stock_mode"] if "stock_mode" in p.keys() else "manual"
     available, used = product_stock_counts(p["id"])
     extra_stock = f"\n🔑 کد آماده: <b>{available}</b>" if mode == "code" else ""
+    price_mode_text = product_price_mode(p)
+    symbol_text = f"\n💱 نماد: <code>{html_escape(symbol['symbol'])}</code>" if symbol else ""
     return f"""📦 <b>{html_escape(p['title'])}</b>
 
 💰 قیمت: <b>{price}</b>
+🏷 نوع قیمت: <code>{price_mode_text}</code>{symbol_text}
 🏷 حالت تحویل: <code>{mode}</code>{extra_stock}
 
 📝 توضیحات:
@@ -2177,7 +2306,7 @@ def handle_user_callback(chat_id, message_id, tg_id, data):
             return edit_message(chat_id,message_id,"برای این محصول قیمت تنظیم نشده است.",back_main())
         set_state(tg_id, "purchase_coupon", {"prod_id": prod_id})
         return edit_message(chat_id,message_id,
-            f"🎟 اگر کد تخفیف داری ارسال کن.\n\nمحصول: {html_escape(p['title'])}\nقیمت: <b>{money(p['price'])}</b> تومان\nموجودی شما: <b>{money(user['balance'])}</b> تومان",
+            f"🎟 اگر کد تخفیف داری ارسال کن.\n\nمحصول: {html_escape(p['title'])}\nقیمت فعلی: <b>{money(get_effective_product_price(prod_id, True)[0])}</b> تومان\nموجودی شما: <b>{money(user['balance'])}</b> تومان",
             kb([[btn("خرید بدون کد تخفیف", f"purchase_now:{prod_id}:NONE")],[btn("🔙 برگشت",f"product:{prod_id}")]]))
 
     if data.startswith("purchase_now:"):
@@ -2235,17 +2364,24 @@ def finalize_purchase(chat_id, message_id, tg_id, prod_id, coupon_code=""):
     user=conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
     if not p:
         conn.close(); return edit_message(chat_id,message_id,"محصول پیدا نشد.",back_main())
+    symbol=get_bound_api_symbol(conn,p)
+    effective_price, price_source=calculate_product_price_from_rows(p,symbol)
+    if effective_price <= 0:
+        conn.close()
+        msgtxt="❌ قیمت این محصول در حال حاضر قابل محاسبه نیست. لطفاً با پشتیبانی تماس بگیرید."
+        markup=kb([[btn("📞 پشتیبانی","support")],[btn("🔙 برگشت",f"product:{prod_id}")]])
+        return send_message(chat_id,msgtxt,markup) if not message_id else edit_message(chat_id,message_id,msgtxt,markup)
     coupon=None; discount=0; coupon_err=""
     if coupon_code:
         coupon=conn.execute("SELECT * FROM coupons WHERE lower(code)=lower(?)",(coupon_code.strip(),)).fetchone()
-        discount, coupon_err = calc_coupon_discount(coupon, p["price"])
+        discount, coupon_err = calc_coupon_discount(coupon, effective_price)
         if coupon_err:
             conn.close()
             return send_message(chat_id,f"❌ {html_escape(coupon_err)}",kb([[btn("🔙 برگشت",f"product:{prod_id}")]])) if not message_id else edit_message(chat_id,message_id,f"❌ {html_escape(coupon_err)}",kb([[btn("🔙 برگشت",f"product:{prod_id}")]]))
-    final_amount = p["price"] - discount
+    final_amount = effective_price - discount
     if user["balance"] < final_amount:
         conn.close()
-        msgtxt=f"❌ موجودی کافی نیست.\n\nقیمت: {money(p['price'])} تومان\nتخفیف: {money(discount)} تومان\nقابل پرداخت: {money(final_amount)} تومان\nموجودی شما: {money(user['balance'])} تومان"
+        msgtxt=f"❌ موجودی کافی نیست.\n\nقیمت: {money(effective_price)} تومان\nتخفیف: {money(discount)} تومان\nقابل پرداخت: {money(final_amount)} تومان\nموجودی شما: {money(user['balance'])} تومان"
         markup=kb([[btn("➕ شارژ کیف پول","wallet_topup")],[btn("🔙 برگشت",f"product:{prod_id}")]])
         return send_message(chat_id,msgtxt,markup) if not message_id else edit_message(chat_id,message_id,msgtxt,markup)
     code=short_code("MV")
@@ -2280,7 +2416,7 @@ def finalize_purchase(chat_id, message_id, tg_id, prod_id, coupon_code=""):
         conn.execute("""INSERT INTO coupon_usages(coupon_id,user_id,order_id,discount_amount,created_at)
                         VALUES(?,?,?,?,?)""", (coupon["id"],tg_id,order_id,discount,now()))
     conn.commit(); conn.close()
-    text=f"✅ سفارش ثبت شد.\n\nکد سفارش: <code>{code}</code>\nقیمت اصلی: {money(p['price'])} تومان\nتخفیف: {money(discount)} تومان\nپرداخت‌شده: <b>{money(final_amount)}</b> تومان\nوضعیت: <b>{status}</b>"
+    text=f"✅ سفارش ثبت شد.\n\nکد سفارش: <code>{code}</code>\nقیمت اصلی: {money(effective_price)} تومان\nتخفیف: {money(discount)} تومان\nپرداخت‌شده: <b>{money(final_amount)}</b> تومان\nوضعیت: <b>{status}</b>"
     if delivery:
         text += f"\n\n🚚 تحویل:\n{html_escape(delivery)}"
     markup=kb([[btn("📦 سفارش‌های من","my_orders")],[btn("🏠 خانه","main")]])
@@ -2866,13 +3002,17 @@ Slug: <code>{cat['slug']}</code>
         prod_id=int(data.split(":")[2])
         conn=db()
         p=conn.execute("""SELECT p.*,c.title cat_title FROM products p LEFT JOIN categories c ON c.id=p.category_id WHERE p.id=?""",(prod_id,)).fetchone()
+        symbol=get_bound_api_symbol(conn,p) if p else None
         conn.close()
         if not p: return edit_message(chat_id,message_id,"محصول پیدا نشد.",admin_products_menu())
+        price_summary=product_price_summary(p,symbol)
         text=f"""📦 <b>{html_escape(p['title'])}</b>
 
 ID: <code>{p['id']}</code>
 دسته: {html_escape(p['cat_title'] or '-')}
-قیمت: <b>{money(p['price'])}</b> تومان
+قیمت ثابت: <b>{money(p['price'])}</b> تومان
+
+{price_summary}
 ترتیب: {p['sort_order']}
 وضعیت: {"فعال ✅" if p["is_active"] else "غیرفعال ❌"}
 حالت موجودی: <code>{p['stock_mode']}</code>
@@ -2887,7 +3027,46 @@ ID: <code>{p['id']}</code>
 {html_escape(p['delivery_text'] or '-')}
 """
         return edit_message(chat_id,message_id,text,admin_product_detail_menu(prod_id))
+    if data.startswith("admin:prod_price_settings:"):
+        prod_id=int(data.split(":")[2])
+        conn=db(); p=conn.execute("SELECT * FROM products WHERE id=?",(prod_id,)).fetchone(); symbol=get_bound_api_symbol(conn,p) if p else None; conn.close()
+        if not p: return edit_message(chat_id,message_id,"محصول پیدا نشد.",admin_products_menu())
+        return edit_message(chat_id,message_id,"🌐 <b>تنظیم قیمت محصول</b>\n\n"+product_price_summary(p,symbol),admin_product_price_menu(prod_id))
+
+    if data.startswith("admin:prod_price_mode:"):
+        parts=data.split(":"); prod_id=int(parts[2]); mode=parts[3]
+        if mode not in ("fixed","online"): mode="fixed"
+        conn=db(); conn.execute("UPDATE products SET price_mode=? WHERE id=?",(mode,prod_id)); conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,f"✅ نوع قیمت روی {mode} تنظیم شد.",admin_product_price_menu(prod_id))
+
+    if data.startswith("admin:prod_symbol_page:"):
+        parts=data.split(":"); prod_id=int(parts[2]); page=safe_int(parts[3],0)
+        txt,markup=admin_product_symbol_picker(prod_id,page)
+        return edit_message(chat_id,message_id,txt,markup)
+
+    if data.startswith("admin:prod_symbol_set:"):
+        parts=data.split(":"); prod_id=int(parts[2]); symbol_id=int(parts[3])
+        conn=db(); sym=conn.execute("SELECT * FROM api_symbols WHERE id=? AND is_active=1",(symbol_id,)).fetchone()
+        if not sym:
+            conn.close(); return edit_message(chat_id,message_id,"نماد پیدا نشد یا غیرفعال است.",admin_product_price_menu(prod_id))
+        conn.execute("UPDATE products SET api_symbol_id=?, price_mode='online' WHERE id=?",(symbol_id,prod_id)); conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,f"✅ نماد {html_escape(sym['symbol'])} به محصول متصل شد.",admin_product_price_menu(prod_id))
+
+    if data.startswith("admin:prod_symbol_clear:"):
+        prod_id=int(data.split(":")[2]); conn=db(); conn.execute("UPDATE products SET api_symbol_id=0 WHERE id=?",(prod_id,)); conn.commit(); conn.close()
+        return edit_message(chat_id,message_id,"✅ اتصال نماد حذف شد.",admin_product_price_menu(prod_id))
+
+    if data.startswith("admin:prod_recalc:"):
+        prod_id=int(data.split(":")[2]); amount,source,p,sym=get_effective_product_price(prod_id,True)
+        return edit_message(chat_id,message_id,f"✅ قیمت محاسبه شد.\n\nقیمت: <b>{money(amount)}</b> تومان\nمنبع: <code>{source}</code>",admin_product_price_menu(prod_id))
+
     for prefix,state_name,prompt in [
+        ("admin:prod_multiplier:","prod_multiplier","ضریب قیمت را ارسال کن. مثال: 10 یا 0.5"),
+        ("admin:prod_profit:","prod_profit","درصد سود را ارسال کن. مثال: 4.5"),
+        ("admin:prod_fixed_fee:","prod_fixed_fee","کارمزد ثابت را به تومان ارسال کن:"),
+        ("admin:prod_min_price:","prod_min_price","حداقل قیمت را به تومان ارسال کن؛ برای غیرفعال 0:"),
+        ("admin:prod_max_price:","prod_max_price","حداکثر قیمت را به تومان ارسال کن؛ برای غیرفعال 0:"),
+        ("admin:prod_fallback:","prod_fallback","قیمت جایگزین زمان خطای API را به تومان ارسال کن:"),
         ("admin:prod_rename:","prod_rename","نام جدید محصول را ارسال کن:"),
         ("admin:prod_price:","prod_price","قیمت جدید را فقط عددی ارسال کن:"),
         ("admin:prod_desc:","prod_desc","توضیح جدید محصول را ارسال کن:"),
@@ -3347,6 +3526,25 @@ def handle_state_message(chat_id,tg_id,text,message=None):
             conn.execute("UPDATE categories SET description=? WHERE id=?",(text.strip(),data["cat_id"])); conn.commit(); send_message(chat_id,"✅ توضیح تغییر کرد.",admin_cats_menu()); return True
         if name=="cat_sort":
             conn.execute("UPDATE categories SET sort_order=? WHERE id=?",(safe_int(text,100),data["cat_id"])); conn.commit(); send_message(chat_id,"✅ ترتیب تغییر کرد.",admin_cats_menu()); return True
+        if name in ("prod_multiplier","prod_profit"):
+            try:
+                value=float(str(text).strip().replace(",","."))
+            except Exception:
+                send_message(chat_id,"❌ مقدار عددی معتبر نیست.",admin_product_price_menu(data["prod_id"])); return True
+            column="price_multiplier" if name=="prod_multiplier" else "profit_percent"
+            conn.execute(f"UPDATE products SET {column}=? WHERE id=?",(value,data["prod_id"])); conn.commit()
+            send_message(chat_id,"✅ مقدار ذخیره شد.",admin_product_price_menu(data["prod_id"])); return True
+        if name in ("prod_fixed_fee","prod_min_price","prod_max_price","prod_fallback"):
+            value=safe_int(only_digits(text),0)
+            column={
+                "prod_fixed_fee":"fixed_fee",
+                "prod_min_price":"min_price",
+                "prod_max_price":"max_price",
+                "prod_fallback":"fallback_price"
+            }[name]
+            conn.execute(f"UPDATE products SET {column}=? WHERE id=?",(value,data["prod_id"])); conn.commit()
+            send_message(chat_id,"✅ مقدار ذخیره شد.",admin_product_price_menu(data["prod_id"])); return True
+
         if name=="prod_add_title":
             conn.execute("""INSERT INTO products(category_id,title,description,price,stock_text,is_active,sort_order,created_at,stock_mode,delivery_text,min_qty,max_qty)
                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (data["cat_id"],text.strip(),"",0,"",1,100,now(),"manual","",1,1))
@@ -3522,5 +3720,6 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
