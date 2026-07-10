@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.tar.gz
+*.zip
+app_backup_*.py
