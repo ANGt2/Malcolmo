@@ -469,6 +469,8 @@ def init_db():
         "price_api_price_path": "price",
         "price_api_id_path": "id",
         "price_api_quote_path": "quote",
+        "price_api_dict_key_as_symbol": "off",
+        "price_api_profile_id": "",
         "price_api_last_sync_status": "never",
         "price_api_last_sync_at": "",
         "price_api_last_sync_message": "",
@@ -1337,6 +1339,229 @@ def admin_ticket_menu(ticket_id):
 
 
 
+
+# -------------------- Iranian-focused API Profiles --------------------
+
+API_PROFILES = {
+    "nobitex": {
+        "title": "🇮🇷 نوبیتکس",
+        "category": "iran",
+        "status": "ready",
+        "description": "پروفایل عمومی قیمت بازار نوبیتکس؛ بدون نیاز به کلید خصوصی.",
+        "settings": {
+            "price_api_enabled": "on",
+            "price_api_profile_id": "nobitex",
+            "price_api_name": "Nobitex",
+            "price_api_base_url": "https://api.nobitex.ir",
+            "price_api_key": "",
+            "price_api_auth_header": "Authorization",
+            "price_api_auth_prefix": "",
+            "price_api_symbols_endpoint": "/v3/orderbook/all",
+            "price_api_symbols_method": "GET",
+            "price_api_query_json": "{}",
+            "price_api_body_json": "{}",
+            "price_api_list_path": "",
+            "price_api_symbol_path": "__key__",
+            "price_api_name_path": "",
+            "price_api_price_path": "lastTradePrice",
+            "price_api_id_path": "",
+            "price_api_quote_path": "",
+            "price_api_dict_key_as_symbol": "on",
+            "price_api_test_endpoint": "/v3/orderbook/BTCIRT",
+        }
+    },
+    "bitpin": {
+        "title": "🇮🇷 بیت‌پین",
+        "category": "iran",
+        "status": "manual",
+        "description": "پروفایل آماده نام‌گذاری شده؛ Endpoint و مسیرهای JSON باید از مستندات رسمی یا پاسخ واقعی API تکمیل شوند.",
+        "settings": {
+            "price_api_profile_id": "bitpin",
+            "price_api_name": "Bitpin",
+            "price_api_enabled": "off",
+        }
+    },
+    "wallex": {
+        "title": "🇮🇷 والکس",
+        "category": "iran",
+        "status": "manual",
+        "description": "پروفایل آماده نام‌گذاری شده؛ Endpoint و مسیرهای JSON باید از مستندات رسمی یا پاسخ واقعی API تکمیل شوند.",
+        "settings": {
+            "price_api_profile_id": "wallex",
+            "price_api_name": "Wallex",
+            "price_api_enabled": "off",
+        }
+    },
+    "abantether": {
+        "title": "🇮🇷 آبان‌تتر",
+        "category": "iran",
+        "status": "manual",
+        "description": "پروفایل آماده نام‌گذاری شده؛ Endpoint و مسیرهای JSON باید از مستندات رسمی یا پاسخ واقعی API تکمیل شوند.",
+        "settings": {
+            "price_api_profile_id": "abantether",
+            "price_api_name": "AbanTether",
+            "price_api_enabled": "off",
+        }
+    },
+    "bit24": {
+        "title": "🇮🇷 بیت۲۴",
+        "category": "iran",
+        "status": "manual",
+        "description": "پروفایل آماده نام‌گذاری شده؛ Endpoint و مسیرهای JSON باید از مستندات رسمی یا پاسخ واقعی API تکمیل شوند.",
+        "settings": {
+            "price_api_profile_id": "bit24",
+            "price_api_name": "Bit24",
+            "price_api_enabled": "off",
+        }
+    },
+    "binance": {
+        "title": "🌍 بایننس",
+        "category": "global",
+        "status": "ready",
+        "description": "قیمت عمومی تمام نمادهای Spot؛ بدون API Key.",
+        "settings": {
+            "price_api_enabled": "on",
+            "price_api_profile_id": "binance",
+            "price_api_name": "Binance",
+            "price_api_base_url": "https://api.binance.com",
+            "price_api_key": "",
+            "price_api_auth_header": "Authorization",
+            "price_api_auth_prefix": "",
+            "price_api_symbols_endpoint": "/api/v3/ticker/price",
+            "price_api_symbols_method": "GET",
+            "price_api_query_json": "{}",
+            "price_api_body_json": "{}",
+            "price_api_list_path": "",
+            "price_api_symbol_path": "symbol",
+            "price_api_name_path": "",
+            "price_api_price_path": "price",
+            "price_api_id_path": "symbol",
+            "price_api_quote_path": "",
+            "price_api_dict_key_as_symbol": "off",
+            "price_api_test_endpoint": "/api/v3/ping",
+        }
+    },
+    "coingecko": {
+        "title": "📊 کوین‌گکو",
+        "category": "data",
+        "status": "ready",
+        "description": "مارکت‌دیتای عمومی بر پایه USD؛ کلید Demo اختیاری است.",
+        "settings": {
+            "price_api_enabled": "on",
+            "price_api_profile_id": "coingecko",
+            "price_api_name": "CoinGecko",
+            "price_api_base_url": "https://api.coingecko.com",
+            "price_api_key": "",
+            "price_api_auth_header": "x-cg-demo-api-key",
+            "price_api_auth_prefix": "",
+            "price_api_symbols_endpoint": "/api/v3/coins/markets",
+            "price_api_symbols_method": "GET",
+            "price_api_query_json": "{\"vs_currency\":\"usd\",\"order\":\"market_cap_desc\",\"per_page\":250,\"page\":1,\"sparkline\":false}",
+            "price_api_body_json": "{}",
+            "price_api_list_path": "",
+            "price_api_symbol_path": "symbol",
+            "price_api_name_path": "name",
+            "price_api_price_path": "current_price",
+            "price_api_id_path": "id",
+            "price_api_quote_path": "",
+            "price_api_dict_key_as_symbol": "off",
+            "price_api_test_endpoint": "/api/v3/ping",
+        }
+    },
+}
+
+def api_profile_status_label(profile):
+    return "✅ آماده" if profile.get("status") == "ready" else "🛠 نیازمند تنظیم"
+
+def api_profiles_main_menu():
+    return kb([
+        [btn("🇮🇷 صرافی‌های ایرانی", "admin:api_profiles:iran")],
+        [btn("🌍 خارجی و مارکت‌دیتا", "admin:api_profiles:other")],
+        [btn("🧩 افزودن و تنظیم دستی", "admin:api_mapper")],
+        [btn("🔙 مدیریت API", "admin:price_api")]
+    ])
+
+def api_profiles_category_menu(category):
+    buttons = []
+    for profile_id, profile in API_PROFILES.items():
+        wanted = profile.get("category") == "iran" if category == "iran" else profile.get("category") in ("global","data")
+        if wanted:
+            buttons.append([btn(
+                f"{api_profile_status_label(profile)} | {profile['title']}",
+                f"admin:api_profile:{profile_id}"
+            )])
+    buttons.append([btn("🔙 پروفایل‌ها", "admin:api_profiles")])
+    return kb(buttons)
+
+def api_profile_text(profile_id):
+    p = API_PROFILES.get(profile_id)
+    if not p:
+        return "پروفایل پیدا نشد."
+    s = p.get("settings", {})
+    status = api_profile_status_label(p)
+    endpoint = s.get("price_api_symbols_endpoint", "هنوز تنظیم نشده")
+    base_url = s.get("price_api_base_url", "هنوز تنظیم نشده")
+    return f"""🧰 <b>{html_escape(p['title'])}</b>
+
+وضعیت: <b>{status}</b>
+
+{html_escape(p.get('description',''))}
+
+Base URL:
+<code>{html_escape(base_url)}</code>
+
+Endpoint:
+<code>{html_escape(endpoint)}</code>
+"""
+
+def api_profile_menu(profile_id):
+    p = API_PROFILES.get(profile_id, {})
+    if p.get("status") == "ready":
+        return kb([
+            [btn("✅ نصب پروفایل", f"admin:api_profile_install:{profile_id}")],
+            [btn("🧪 نصب و تست", f"admin:api_profile_install_test:{profile_id}")],
+            [btn("🔙 پروفایل‌ها", "admin:api_profiles")]
+        ])
+    return kb([
+        [btn("🛠 نصب قالب و تکمیل دستی", f"admin:api_profile_install:{profile_id}")],
+        [btn("🧩 ورود به تنظیم دستی", "admin:api_mapper")],
+        [btn("🔙 پروفایل‌ها", "admin:api_profiles")]
+    ])
+
+def install_api_profile(profile_id):
+    profile = API_PROFILES.get(profile_id)
+    if not profile:
+        raise RuntimeError("پروفایل پیدا نشد.")
+
+    # Reset connection/mapping fields first so old provider data does not leak.
+    reset_values = {
+        "price_api_key": "",
+        "price_api_base_url": "",
+        "price_api_auth_header": "Authorization",
+        "price_api_auth_prefix": "",
+        "price_api_symbols_endpoint": "",
+        "price_api_symbols_method": "GET",
+        "price_api_query_json": "{}",
+        "price_api_body_json": "{}",
+        "price_api_list_path": "",
+        "price_api_symbol_path": "symbol",
+        "price_api_name_path": "name",
+        "price_api_price_path": "price",
+        "price_api_id_path": "id",
+        "price_api_quote_path": "quote",
+        "price_api_dict_key_as_symbol": "off",
+        "price_api_test_endpoint": "",
+    }
+    for key, value in reset_values.items():
+        set_setting(key, value)
+
+    for key, value in profile.get("settings", {}).items():
+        set_setting(key, str(value))
+
+    set_setting("price_api_last_test_status", "never")
+    set_setting("price_api_last_sync_status", "never")
+    return profile
+
 # -------------------- Generic JSON Symbols Mapper --------------------
 
 def json_path_get(data, path, default=None):
@@ -1433,9 +1658,20 @@ def map_api_symbols(payload):
     if rows is None:
         raise RuntimeError("مسیر لیست در پاسخ پیدا نشد.")
     if isinstance(rows, dict):
-        rows = list(rows.values())
+        if get_setting("price_api_dict_key_as_symbol","off") == "on":
+            converted = []
+            for dict_key, dict_value in rows.items():
+                if dict_key in ("status","code","message","msg","time","timestamp"):
+                    continue
+                if isinstance(dict_value, dict):
+                    item = dict(dict_value)
+                    item["__key__"] = dict_key
+                    converted.append(item)
+            rows = converted
+        else:
+            rows = list(rows.values())
     if not isinstance(rows, list):
-        raise RuntimeError("خروجی مسیر لیست باید آرایه باشد.")
+        raise RuntimeError("خروجی مسیر لیست باید آرایه یا object قابل تبدیل باشد.")
 
     symbol_path = get_setting("price_api_symbol_path", "symbol")
     name_path = get_setting("price_api_name_path", "name")
@@ -1722,6 +1958,7 @@ def price_api_admin_menu():
         [btn("🧾 Auth Header", "admin:price_api_set_header"), btn("🏷 Auth Prefix", "admin:price_api_set_prefix")],
         [btn("🧪 Test Endpoint", "admin:price_api_set_test_endpoint"), btn("⏱ Timeout", "admin:price_api_set_timeout")],
         [btn("🔍 تست اتصال", "admin:price_api_test")],
+        [btn("🧰 پروفایل‌های آماده API", "admin:api_profiles")],
         [btn("🧩 تنظیم نمادها و قیمت‌ها", "admin:api_mapper")],
         [btn("⚙️ موتور قیمت خودکار", "admin:price_engine")],
         [btn("💱 لیست نمادها", "admin:api_symbols:0")],
@@ -2714,6 +2951,68 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
 
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
+
+    if data=="admin:api_profiles":
+        return edit_message(
+            chat_id,message_id,
+            "🧰 <b>پروفایل‌های API</b>\n\nتمرکز اصلی روی صرافی‌های ایرانی است. موارد «نیازمند تنظیم» عمداً بدون Endpoint حدسی ثبت شده‌اند.",
+            api_profiles_main_menu()
+        )
+
+    if data.startswith("admin:api_profiles:"):
+        category=data.split(":")[2]
+        title="🇮🇷 <b>صرافی‌های ایرانی</b>" if category=="iran" else "🌍 <b>خارجی و مارکت‌دیتا</b>"
+        return edit_message(chat_id,message_id,title,api_profiles_category_menu(category))
+
+    if data.startswith("admin:api_profile:"):
+        profile_id=data.split(":")[2]
+        return edit_message(chat_id,message_id,api_profile_text(profile_id),api_profile_menu(profile_id))
+
+    if data.startswith("admin:api_profile_install_test:"):
+        profile_id=data.split(":")[2]
+        try:
+            profile=install_api_profile(profile_id)
+            if profile.get("status") != "ready":
+                return edit_message(
+                    chat_id,message_id,
+                    "🛠 قالب پروفایل نصب شد، اما برای تست باید Base URL، Endpoint و مسیرهای JSON را در تنظیم دستی کامل کنی.",
+                    kb([[btn("🧩 تنظیم دستی","admin:api_mapper")],[btn("🔙 پروفایل‌ها","admin:api_profiles")]])
+                )
+            payload=fetch_price_api_json()
+            mapped,skipped=map_api_symbols(payload)
+            lines=[
+                f"✅ پروفایل <b>{html_escape(profile['title'])}</b> نصب و تست شد.",
+                f"\nنمادهای قابل خواندن: <b>{len(mapped)}</b> | ردشده: <b>{skipped}</b>\n"
+            ]
+            for item in mapped[:5]:
+                lines.append(f"• <b>{html_escape(item['symbol'])}</b> | <code>{item['price']}</code>")
+            return edit_message(chat_id,message_id,"\n".join(lines),kb([
+                [btn("🔄 دریافت و ذخیره نمادها","admin:api_symbols_sync")],
+                [btn("⚙️ تنظیمات API","admin:price_api")]
+            ]))
+        except Exception as e:
+            return edit_message(
+                chat_id,message_id,
+                f"⚠️ پروفایل نصب شد، اما تست ناموفق بود:\n<code>{html_escape(repr(e))[:2800]}</code>",
+                kb([[btn("🧩 تنظیم دستی","admin:api_mapper")],[btn("🔙 پروفایل‌ها","admin:api_profiles")]])
+            )
+
+    if data.startswith("admin:api_profile_install:"):
+        profile_id=data.split(":")[2]
+        try:
+            profile=install_api_profile(profile_id)
+            log_admin(tg_id,"api_profile_install",profile_id)
+            if profile.get("status") == "ready":
+                text_out=f"✅ پروفایل <b>{html_escape(profile['title'])}</b> نصب شد."
+            else:
+                text_out=f"🛠 قالب <b>{html_escape(profile['title'])}</b> نصب شد؛ حالا تنظیمات فنی آن را دستی تکمیل کن."
+            return edit_message(chat_id,message_id,text_out,kb([
+                [btn("🧩 تنظیم و مپ JSON","admin:api_mapper")],
+                [btn("🧪 تست ساختار","admin:api_map_preview")],
+                [btn("🔙 مدیریت API","admin:price_api")]
+            ]))
+        except Exception as e:
+            return edit_message(chat_id,message_id,f"❌ خطا:\n<code>{html_escape(repr(e))}</code>",api_profiles_main_menu())
 
     if data=="admin:price_engine":
         return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
@@ -3971,6 +4270,9 @@ def handle_message(message):
     if text=="/priceengine":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,price_engine_admin_text(),price_engine_admin_menu())
+    if text=="/apiprofiles":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,"🧰 پروفایل‌های آماده API",api_profiles_main_menu())
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
