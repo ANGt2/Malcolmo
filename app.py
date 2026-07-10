@@ -53,6 +53,10 @@ Part 03 adds:
 - product binding to API symbols
 - online price rules and calculation
 - fixed/online product price modes
+- finance ledger core
+- order profit snapshots
+- automatic sales/refund accounting
+- admin finance dashboard and exports
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib
@@ -332,6 +336,71 @@ def init_db():
         created_at TEXT NOT NULL,
         FOREIGN KEY(order_id) REFERENCES orders(id)
     )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS finance_transactions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tx_code TEXT UNIQUE NOT NULL,
+        unique_key TEXT UNIQUE DEFAULT '',
+        tx_type TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        amount INTEGER NOT NULL DEFAULT 0,
+        currency TEXT DEFAULT 'IRT',
+        order_id INTEGER DEFAULT 0,
+        user_id INTEGER DEFAULT 0,
+        product_id INTEGER DEFAULT 0,
+        admin_id INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'posted',
+        description TEXT DEFAULT '',
+        metadata_json TEXT DEFAULT '{}',
+        created_at TEXT NOT NULL
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS profit_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER UNIQUE NOT NULL,
+        order_code TEXT DEFAULT '',
+        user_id INTEGER DEFAULT 0,
+        product_id INTEGER DEFAULT 0,
+        product_title TEXT DEFAULT '',
+        quantity INTEGER DEFAULT 1,
+        sale_amount INTEGER DEFAULT 0,
+        purchase_cost INTEGER DEFAULT 0,
+        visible_fee INTEGER DEFAULT 0,
+        discount_amount INTEGER DEFAULT 0,
+        gross_profit INTEGER DEFAULT 0,
+        net_profit INTEGER DEFAULT 0,
+        profit_percent REAL DEFAULT 0,
+        source TEXT DEFAULT 'system',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS finance_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id INTEGER DEFAULT 0,
+        action TEXT NOT NULL,
+        entity_type TEXT DEFAULT '',
+        entity_id INTEGER DEFAULT 0,
+        old_value TEXT DEFAULT '',
+        new_value TEXT DEFAULT '',
+        detail TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+    )""")
+
+    for column_sql in [
+        "ALTER TABLE orders ADD COLUMN finance_status TEXT DEFAULT 'unrecorded'",
+        "ALTER TABLE orders ADD COLUMN finance_recorded_at TEXT DEFAULT ''",
+        "ALTER TABLE orders ADD COLUMN finance_sale_amount INTEGER DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN finance_purchase_cost INTEGER DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN finance_visible_fee INTEGER DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN finance_gross_profit INTEGER DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN finance_net_profit INTEGER DEFAULT 0",
+        "ALTER TABLE orders ADD COLUMN finance_profit_percent REAL DEFAULT 0"
+    ]:
+        try:
+            c.execute(column_sql)
+        except sqlite3.OperationalError:
+            pass
 
     c.execute("""CREATE TABLE IF NOT EXISTS admin_logs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -692,6 +761,12 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_sync_logs_started ON api_sync_logs(started_at)",
         "CREATE INDEX IF NOT EXISTS idx_api_providers_priority ON api_providers(is_active,priority)",
         "CREATE INDEX IF NOT EXISTS idx_api_provider_events_provider ON api_provider_events(provider_id,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_tx_type_time ON finance_transactions(tx_type,created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_tx_order ON finance_transactions(order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_tx_user ON finance_transactions(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_profit_order ON profit_snapshots(order_id)",
+        "CREATE INDEX IF NOT EXISTS idx_profit_created ON profit_snapshots(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_finance_logs_entity ON finance_logs(entity_type,entity_id)",
     ]
     for q in indexes:
         c.execute(q)
@@ -793,6 +868,383 @@ def stats():
         data[name]=conn.execute(q).fetchone()["n"]
     conn.close(); return data
 
+
+# -------------------- Finance Core --------------------
+
+FINANCE_SUCCESS_STATUSES = {"completed", "done"}
+FINANCE_ACTIVE_SALE_STATUSES = {"completed", "done", "delivered"}
+
+
+def finance_tx_code():
+    return f"FT-{datetime.now().strftime('%y%m%d%H%M%S')}-{random.randint(1000,9999)}"
+
+
+def finance_log(conn, action, entity_type="", entity_id=0, old_value="",
+                new_value="", detail="", admin_id=0):
+    conn.execute("""INSERT INTO finance_logs(
+                    admin_id,action,entity_type,entity_id,old_value,new_value,detail,created_at
+                  ) VALUES(?,?,?,?,?,?,?,?)""",
+                 (
+                     int(admin_id or 0), str(action or ""), str(entity_type or ""),
+                     int(entity_id or 0), str(old_value or "")[:2000],
+                     str(new_value or "")[:2000], str(detail or "")[:3000], now()
+                 ))
+
+
+def create_finance_transaction(conn, tx_type, direction, amount, *,
+                               unique_key="", order_id=0, user_id=0,
+                               product_id=0, admin_id=0, description="",
+                               metadata=None, status="posted"):
+    amount = max(0, int(amount or 0))
+    unique_key = str(unique_key or "")
+    if unique_key:
+        old = conn.execute(
+            "SELECT id FROM finance_transactions WHERE unique_key=?",
+            (unique_key,)
+        ).fetchone()
+        if old:
+            return int(old["id"])
+
+    tx_code = finance_tx_code()
+    metadata_json = json.dumps(metadata or {}, ensure_ascii=False, separators=(",", ":"))
+    conn.execute("""INSERT INTO finance_transactions(
+                    tx_code,unique_key,tx_type,direction,amount,currency,
+                    order_id,user_id,product_id,admin_id,status,
+                    description,metadata_json,created_at
+                  ) VALUES(?,?,?,?,?,'IRT',?,?,?,?,?,?,?,?)""",
+                 (
+                     tx_code, unique_key, tx_type, direction, amount,
+                     int(order_id or 0), int(user_id or 0), int(product_id or 0),
+                     int(admin_id or 0), status, str(description or "")[:2000],
+                     metadata_json[:8000], now()
+                 ))
+    return int(conn.execute("SELECT last_insert_rowid() x").fetchone()["x"])
+
+
+def order_finance_values(conn, order_id):
+    order = conn.execute("""SELECT o.*,p.title current_product_title
+                            FROM orders o
+                            LEFT JOIN products p ON p.id=o.product_id
+                            WHERE o.id=?""", (order_id,)).fetchone()
+    if not order:
+        raise RuntimeError("سفارش پیدا نشد.")
+
+    sale_amount = int(order["final_amount"] or order["amount"] or 0)
+    purchase_cost = int(order["purchase_price"] or 0)
+
+    # If an actual delivered code exists, use its recorded inventory cost.
+    code_row = conn.execute("""SELECT unit_cost FROM product_codes
+                              WHERE order_id=? AND status='used'
+                              ORDER BY id DESC LIMIT 1""", (order_id,)).fetchone()
+    if code_row and int(code_row["unit_cost"] or 0) > 0:
+        purchase_cost = int(code_row["unit_cost"] or 0)
+
+    visible_fee = int(order["visible_fee"] or 0)
+    discount_amount = int(order["discount_amount"] or 0)
+    gross_profit = sale_amount - purchase_cost
+    net_profit = gross_profit - visible_fee
+    profit_percent = (net_profit * 100.0 / purchase_cost) if purchase_cost > 0 else 0.0
+
+    return order, {
+        "sale_amount": sale_amount,
+        "purchase_cost": purchase_cost,
+        "visible_fee": visible_fee,
+        "discount_amount": discount_amount,
+        "gross_profit": gross_profit,
+        "net_profit": net_profit,
+        "profit_percent": round(profit_percent, 4),
+    }
+
+
+def record_order_finance(conn, order_id, admin_id=0, source="system"):
+    order, values = order_finance_values(conn, order_id)
+    if str(order["status"] or "") not in FINANCE_ACTIVE_SALE_STATUSES:
+        return False, "وضعیت سفارش برای ثبت مالی مناسب نیست."
+
+    conn.execute("""INSERT INTO profit_snapshots(
+                    order_id,order_code,user_id,product_id,product_title,quantity,
+                    sale_amount,purchase_cost,visible_fee,discount_amount,
+                    gross_profit,net_profit,profit_percent,source,created_at,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(order_id) DO UPDATE SET
+                    order_code=excluded.order_code,
+                    user_id=excluded.user_id,
+                    product_id=excluded.product_id,
+                    product_title=excluded.product_title,
+                    quantity=excluded.quantity,
+                    sale_amount=excluded.sale_amount,
+                    purchase_cost=excluded.purchase_cost,
+                    visible_fee=excluded.visible_fee,
+                    discount_amount=excluded.discount_amount,
+                    gross_profit=excluded.gross_profit,
+                    net_profit=excluded.net_profit,
+                    profit_percent=excluded.profit_percent,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at""",
+                 (
+                     order_id, order["order_code"], order["user_id"],
+                     int(order["product_id"] or 0),
+                     order["product_title_snapshot"] or order["current_product_title"] or "",
+                     int(order["qty"] or 1),
+                     values["sale_amount"], values["purchase_cost"],
+                     values["visible_fee"], values["discount_amount"],
+                     values["gross_profit"], values["net_profit"],
+                     values["profit_percent"], source, now(), now()
+                 ))
+
+    create_finance_transaction(
+        conn, "sale", "credit", values["sale_amount"],
+        unique_key=f"order:{order_id}:sale",
+        order_id=order_id, user_id=order["user_id"],
+        product_id=order["product_id"], admin_id=admin_id,
+        description=f"فروش سفارش {order['order_code']}"
+    )
+
+    if values["purchase_cost"] > 0:
+        create_finance_transaction(
+            conn, "cost_of_goods", "debit", values["purchase_cost"],
+            unique_key=f"order:{order_id}:cogs",
+            order_id=order_id, user_id=order["user_id"],
+            product_id=order["product_id"], admin_id=admin_id,
+            description=f"بهای خرید ووچر سفارش {order['order_code']}"
+        )
+
+    if values["visible_fee"] > 0:
+        create_finance_transaction(
+            conn, "fee", "credit", values["visible_fee"],
+            unique_key=f"order:{order_id}:fee",
+            order_id=order_id, user_id=order["user_id"],
+            product_id=order["product_id"], admin_id=admin_id,
+            description=f"کارمزد سفارش {order['order_code']}"
+        )
+
+    conn.execute("""UPDATE orders SET
+                    finance_status='recorded',
+                    finance_recorded_at=?,
+                    finance_sale_amount=?,
+                    finance_purchase_cost=?,
+                    finance_visible_fee=?,
+                    finance_gross_profit=?,
+                    finance_net_profit=?,
+                    finance_profit_percent=?
+                    WHERE id=?""",
+                 (
+                     now(), values["sale_amount"], values["purchase_cost"],
+                     values["visible_fee"], values["gross_profit"],
+                     values["net_profit"], values["profit_percent"], order_id
+                 ))
+
+    finance_log(
+        conn, "record_order_finance", "order", order_id,
+        old_value=order["finance_status"] if "finance_status" in order.keys() else "",
+        new_value="recorded",
+        detail=json.dumps(values, ensure_ascii=False),
+        admin_id=admin_id
+    )
+    return True, values
+
+
+def record_order_refund_finance(conn, order_id, amount, admin_id=0, reason=""):
+    order = conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+    if not order:
+        return 0
+    tx_id = create_finance_transaction(
+        conn, "refund", "debit", amount,
+        unique_key=f"order:{order_id}:refund",
+        order_id=order_id, user_id=order["user_id"],
+        product_id=order["product_id"], admin_id=admin_id,
+        description=reason or f"بازگشت وجه سفارش {order['order_code']}"
+    )
+    conn.execute("UPDATE orders SET finance_status='refunded' WHERE id=?", (order_id,))
+    finance_log(
+        conn, "record_order_refund", "order", order_id,
+        new_value=str(amount), detail=reason, admin_id=admin_id
+    )
+    return tx_id
+
+
+def finance_period_clause(period):
+    period = str(period or "today")
+    if period == "today":
+        return "substr(created_at,1,10)=substr(datetime('now','localtime'),1,10)"
+    if period == "yesterday":
+        return "substr(created_at,1,10)=substr(datetime('now','localtime','-1 day'),1,10)"
+    if period == "week":
+        return "datetime(created_at)>=datetime('now','localtime','-7 day')"
+    if period == "month":
+        return "substr(created_at,1,7)=substr(datetime('now','localtime'),1,7)"
+    if period == "year":
+        return "substr(created_at,1,4)=substr(datetime('now','localtime'),1,4)"
+    return "1=1"
+
+
+def finance_summary(period="today"):
+    clause = finance_period_clause(period)
+    conn = db()
+    tx = conn.execute(f"""SELECT
+        COALESCE(SUM(CASE WHEN tx_type='sale' THEN amount ELSE 0 END),0) sales,
+        COALESCE(SUM(CASE WHEN tx_type='refund' THEN amount ELSE 0 END),0) refunds,
+        COALESCE(SUM(CASE WHEN tx_type='cost_of_goods' THEN amount ELSE 0 END),0) costs,
+        COALESCE(SUM(CASE WHEN tx_type='fee' THEN amount ELSE 0 END),0) fees,
+        COUNT(*) tx_count
+        FROM finance_transactions WHERE status='posted' AND {clause}""").fetchone()
+    profit = conn.execute(f"""SELECT
+        COALESCE(SUM(gross_profit),0) gross_profit,
+        COALESCE(SUM(net_profit),0) net_profit,
+        COALESCE(AVG(sale_amount),0) avg_order,
+        COUNT(*) order_count
+        FROM profit_snapshots WHERE {clause}""").fetchone()
+    conn.close()
+    return {
+        "sales": int(tx["sales"] or 0),
+        "refunds": int(tx["refunds"] or 0),
+        "costs": int(tx["costs"] or 0),
+        "fees": int(tx["fees"] or 0),
+        "tx_count": int(tx["tx_count"] or 0),
+        "gross_profit": int(profit["gross_profit"] or 0),
+        "net_profit": int(profit["net_profit"] or 0),
+        "avg_order": int(profit["avg_order"] or 0),
+        "order_count": int(profit["order_count"] or 0),
+    }
+
+
+def finance_period_title(period):
+    return {
+        "today": "امروز",
+        "yesterday": "دیروز",
+        "week": "۷ روز اخیر",
+        "month": "این ماه",
+        "year": "امسال",
+        "all": "کل دوره",
+    }.get(period, period)
+
+
+def finance_dashboard_text(period="today"):
+    s = finance_summary(period)
+    return f"""💰 <b>مرکز مالی — {finance_period_title(period)}</b>
+
+تعداد سفارش مالی: <b>{s['order_count']}</b>
+تعداد رویداد Ledger: <b>{s['tx_count']}</b>
+
+فروش: <b>{money(s['sales'])}</b> تومان
+هزینه خرید ووچرها: <b>{money(s['costs'])}</b> تومان
+کارمزد ثبت‌شده: <b>{money(s['fees'])}</b> تومان
+Refund: <b>{money(s['refunds'])}</b> تومان
+
+سود ناخالص: <b>{money(s['gross_profit'])}</b> تومان
+سود خالص: <b>{money(s['net_profit'])}</b> تومان
+میانگین مبلغ سفارش: <b>{money(s['avg_order'])}</b> تومان
+
+اطلاعات سود و قیمت خرید فقط در پنل ادمین نمایش داده می‌شود.
+"""
+
+
+def finance_dashboard_menu(period="today"):
+    return kb([
+        [btn("امروز", "admin:finance:today"), btn("دیروز", "admin:finance:yesterday")],
+        [btn("۷ روز", "admin:finance:week"), btn("ماه", "admin:finance:month")],
+        [btn("سال", "admin:finance:year"), btn("کل", "admin:finance:all")],
+        [btn("📜 آخرین تراکنش‌ها", "admin:finance_transactions:0")],
+        [btn("🔄 بازسازی مالی سفارش‌ها", "admin:finance_rebuild_confirm")],
+        [btn("📤 خروجی CSV", "admin:finance_export_csv"),
+         btn("📤 خروجی JSON", "admin:finance_export_json")],
+        [btn("🔙 پنل ادمین", "admin:home")]
+    ])
+
+
+def finance_transactions_text(page=0):
+    page = max(0, int(page))
+    size = 15
+    offset = page * size
+    conn = db()
+    total = conn.execute("SELECT COUNT(*) n FROM finance_transactions").fetchone()["n"]
+    rows = conn.execute("""SELECT * FROM finance_transactions
+                           ORDER BY id DESC LIMIT ? OFFSET ?""",
+                        (size, offset)).fetchall()
+    conn.close()
+    lines = [f"📜 <b>تراکنش‌های مالی</b>\nتعداد: <b>{total}</b> | صفحه: <b>{page+1}</b>\n"]
+    for row in rows:
+        icon = "➕" if row["direction"] == "credit" else "➖"
+        lines.append(
+            f"{icon} #{row['id']} <code>{row['tx_code']}</code>\n"
+            f"{html_escape(row['tx_type'])} | {money(row['amount'])} تومان | "
+            f"سفارش: {row['order_id'] or '-'} | {row['created_at']}"
+        )
+    return "\n\n".join(lines), total, size
+
+
+def finance_transactions_menu(page, total, size):
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️ قبلی", f"admin:finance_transactions:{page-1}"))
+    if (page + 1) * size < total:
+        nav.append(btn("بعدی ➡️", f"admin:finance_transactions:{page+1}"))
+    rows = []
+    if nav:
+        rows.append(nav)
+    rows.append([btn("🔙 مرکز مالی", "admin:finance:today")])
+    return kb(rows)
+
+
+def rebuild_finance_from_orders(admin_id=0):
+    conn = db()
+    rows = conn.execute("""SELECT id FROM orders
+                           WHERE status IN ('completed','done','delivered')
+                           ORDER BY id ASC""").fetchall()
+    ok = failed = 0
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for row in rows:
+            try:
+                success, _ = record_order_finance(conn, row["id"], admin_id, "rebuild")
+                if success:
+                    ok += 1
+                else:
+                    failed += 1
+            except Exception:
+                failed += 1
+        finance_log(
+            conn, "rebuild_finance", "system", 0,
+            new_value=f"ok={ok},failed={failed}", admin_id=admin_id
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return ok, failed
+
+
+def finance_export_csv_text():
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id","tx_code","tx_type","direction","amount","order_id",
+        "user_id","product_id","admin_id","status","description","created_at"
+    ])
+    conn = db()
+    rows = conn.execute("""SELECT id,tx_code,tx_type,direction,amount,order_id,
+                                  user_id,product_id,admin_id,status,description,created_at
+                           FROM finance_transactions ORDER BY id DESC""").fetchall()
+    conn.close()
+    for row in rows:
+        writer.writerow([row[k] for k in row.keys()])
+    return output.getvalue()
+
+
+def finance_export_json_text():
+    conn = db()
+    tx_rows = conn.execute("SELECT * FROM finance_transactions ORDER BY id DESC").fetchall()
+    profit_rows = conn.execute("SELECT * FROM profit_snapshots ORDER BY id DESC").fetchall()
+    conn.close()
+    payload = {
+        "generated_at": now(),
+        "transactions": [dict(row) for row in tx_rows],
+        "profit_snapshots": [dict(row) for row in profit_rows],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
 # -------------------- State --------------------
 
 def set_state(tg_id,name,data=None): STATE[tg_id]={"name":name,"data":data or {}, "time":time.time()}
@@ -871,6 +1323,7 @@ def admin_menu():
         [btn("📣 پیام همگانی", "admin:broadcast"), btn("💾 بکاپ دیتابیس", "admin:backup")],
         [btn("🌐 API قیمت‌ها", "admin:price_api")],
         [btn("📦 انبار حرفه‌ای ووچر", "admin:inventory")],
+        [btn("💰 مرکز مالی", "admin:finance:today")],
         [btn("🏠 منوی کاربر", "main")],
     ])
 
@@ -1938,6 +2391,19 @@ def set_order_status(conn, order_id, new_status, actor_type="system", actor_id=0
         conn.execute("UPDATE orders SET status=?, updated_at=?, last_admin_id=? WHERE id=?",
                      (new_status,now(),int(actor_id or 0) if actor_type=='admin' else 0,order_id))
     add_order_status_history(conn,order_id,old_status,new_status,actor_type,actor_id,reason)
+    if new_status in FINANCE_SUCCESS_STATUSES:
+        try:
+            record_order_finance(
+                conn, order_id,
+                int(actor_id or 0) if actor_type=="admin" else 0,
+                "status_change"
+            )
+        except Exception as finance_error:
+            finance_log(
+                conn, "record_order_finance_error", "order", order_id,
+                detail=repr(finance_error),
+                admin_id=int(actor_id or 0) if actor_type=="admin" else 0
+            )
     return True
 
 
@@ -1983,6 +2449,7 @@ def refund_order_safe(conn, order_id, admin_id=0, reason=""):
                  (order_id,o["user_id"],amount,tx_id,int(admin_id or 0),reason or "",now()))
     conn.execute("UPDATE orders SET refund_amount=?,refund_tx_id=? WHERE id=?",(amount,tx_id,order_id))
     set_order_status(conn,order_id,"refunded","admin" if admin_id else "system",admin_id,reason or "بازگشت وجه")
+    record_order_refund_finance(conn,order_id,amount,admin_id,reason or "بازگشت وجه")
     return True,amount,"بازگشت وجه انجام شد."
 
 
@@ -4290,6 +4757,60 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:home": clear_state(tg_id); return edit_message(chat_id,message_id,render_admin_home(),admin_menu())
     if data=="admin:stats": return edit_message(chat_id,message_id,render_admin_home(),admin_menu())
 
+    if data.startswith("admin:finance:"):
+        period=data.split(":")[2]
+        return edit_message(chat_id,message_id,finance_dashboard_text(period),finance_dashboard_menu(period))
+
+    if data.startswith("admin:finance_transactions:"):
+        page=safe_int(data.split(":")[2],0)
+        text_out,total,size=finance_transactions_text(page)
+        return edit_message(chat_id,message_id,text_out,finance_transactions_menu(page,total,size))
+
+    if data=="admin:finance_rebuild_confirm":
+        return edit_message(
+            chat_id,message_id,
+            "تمام سفارش‌های تکمیل/تحویل‌شده دوباره بررسی و اطلاعات مالی آن‌ها ثبت یا بروزرسانی شود؟",
+            kb([
+                [btn("✅ شروع بازسازی","admin:finance_rebuild")],
+                [btn("❌ انصراف","admin:finance:today")]
+            ])
+        )
+
+    if data=="admin:finance_rebuild":
+        try:
+            ok,failed=rebuild_finance_from_orders(tg_id)
+            return edit_message(
+                chat_id,message_id,
+                f"✅ بازسازی مالی تمام شد.\nموفق: <b>{ok}</b>\nخطا/ردشده: <b>{failed}</b>",
+                finance_dashboard_menu("today")
+            )
+        except Exception as e:
+            return edit_message(
+                chat_id,message_id,
+                f"❌ بازسازی ناموفق بود:\n<code>{html_escape(repr(e))[:2500]}</code>",
+                finance_dashboard_menu("today")
+            )
+
+    if data=="admin:finance_export_csv":
+        content=finance_export_csv_text()
+        send_text_file(
+            chat_id,
+            f"mvlite_finance_{int(time.time())}.csv",
+            content,
+            "💰 خروجی CSV مرکز مالی"
+        )
+        return edit_message(chat_id,message_id,"✅ خروجی CSV ارسال شد.",finance_dashboard_menu("today"))
+
+    if data=="admin:finance_export_json":
+        content=finance_export_json_text()
+        send_text_file(
+            chat_id,
+            f"mvlite_finance_{int(time.time())}.json",
+            content,
+            "💰 خروجی JSON مرکز مالی"
+        )
+        return edit_message(chat_id,message_id,"✅ خروجی JSON ارسال شد.",finance_dashboard_menu("today"))
+
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
@@ -6022,6 +6543,10 @@ def handle_message(message):
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,inventory_dashboard_text(),inventory_dashboard_menu())
 
+    if text=="/finance":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,finance_dashboard_text("today"),finance_dashboard_menu("today"))
+
     if text=="/admin":
         if not is_admin(tg_id): return send_message(chat_id,"❌ شما ادمین نیستید.\nاگر اولین اجراست، /claim_admin را بزنید.")
         clear_state(tg_id); return send_message(chat_id,render_admin_home(),admin_menu())
@@ -6112,6 +6637,7 @@ def main():
 
 if __name__=="__main__":
     main()
+
 
 
 
