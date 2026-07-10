@@ -401,6 +401,23 @@ def init_db():
         UNIQUE(provider_name, symbol)
     )""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS api_price_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol_id INTEGER NOT NULL,
+        price REAL DEFAULT 0,
+        recorded_at TEXT NOT NULL,
+        FOREIGN KEY(symbol_id) REFERENCES api_symbols(id)
+    )""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS api_sync_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        status TEXT NOT NULL,
+        message TEXT DEFAULT '',
+        symbols_count INTEGER DEFAULT 0,
+        started_at TEXT NOT NULL,
+        finished_at TEXT DEFAULT ''
+    )""")
+
     try:
         c.execute("ALTER TABLE users ADD COLUMN muted_until INTEGER DEFAULT 0")
     except sqlite3.OperationalError:
@@ -455,6 +472,13 @@ def init_db():
         "price_api_last_sync_status": "never",
         "price_api_last_sync_at": "",
         "price_api_last_sync_message": "",
+        "price_engine_auto_sync": "off",
+        "price_engine_interval_seconds": "300",
+        "price_engine_max_age_seconds": "900",
+        "price_engine_stale_policy": "last",
+        "price_engine_recalc_after_sync": "on",
+        "price_engine_history_enabled": "on",
+        "price_engine_last_auto_run": "",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
@@ -488,6 +512,8 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_api_symbols_active ON api_symbols(is_active)",
         "CREATE INDEX IF NOT EXISTS idx_products_price_mode ON products(price_mode)",
         "CREATE INDEX IF NOT EXISTS idx_products_api_symbol ON products(api_symbol_id)",
+        "CREATE INDEX IF NOT EXISTS idx_price_history_symbol_time ON api_price_history(symbol_id,recorded_at)",
+        "CREATE INDEX IF NOT EXISTS idx_sync_logs_started ON api_sync_logs(started_at)",
     ]
     for q in indexes:
         c.execute(q)
@@ -765,6 +791,216 @@ def admin_payment_detail_menu(pay_id):
     ])
 
 
+
+# -------------------- Automatic Price Engine --------------------
+
+PRICE_ENGINE_NEXT_RUN = 0
+
+def parse_dt(value):
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def symbol_age_seconds(symbol_row):
+    if not symbol_row:
+        return 10**9
+    dt = parse_dt(symbol_row["updated_at"] if "updated_at" in symbol_row.keys() else "")
+    if not dt:
+        return 10**9
+    return max(0, int((datetime.now() - dt).total_seconds()))
+
+def symbol_is_stale(symbol_row):
+    max_age = max(30, safe_int(get_setting("price_engine_max_age_seconds","900"),900))
+    return symbol_age_seconds(symbol_row) > max_age
+
+def price_engine_policy():
+    policy = get_setting("price_engine_stale_policy","last").strip().lower()
+    return policy if policy in ("last","fallback","block") else "last"
+
+def record_symbol_price_history(conn, symbol_id, price):
+    if get_setting("price_engine_history_enabled","on") != "on":
+        return
+    conn.execute("""INSERT INTO api_price_history(symbol_id,price,recorded_at)
+                    VALUES(?,?,?)""", (symbol_id,float(price or 0),now()))
+
+def recalculate_all_online_products(conn=None):
+    own = conn is None
+    if own:
+        conn = db()
+    rows = conn.execute("SELECT * FROM products WHERE price_mode='online'").fetchall()
+    updated = 0
+    blocked = 0
+    for p in rows:
+        symbol = get_bound_api_symbol(conn,p)
+        amount, source = calculate_product_price_from_rows(p,symbol)
+        conn.execute("""UPDATE products
+                        SET last_calculated_price=?, price_updated_at=?
+                        WHERE id=?""", (amount,now(),p["id"]))
+        updated += 1
+        if amount <= 0:
+            blocked += 1
+    if own:
+        conn.commit(); conn.close()
+    return updated, blocked
+
+def run_price_engine_sync(trigger="manual"):
+    started = now()
+    log_conn = db()
+    log_conn.execute("""INSERT INTO api_sync_logs(status,message,symbols_count,started_at,finished_at)
+                        VALUES(?,?,?,?,?)""", ("running",trigger,0,started,""))
+    log_id = log_conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+    log_conn.commit(); log_conn.close()
+    try:
+        payload = fetch_price_api_json()
+        mapped, skipped = map_api_symbols(payload)
+        provider = get_setting("price_api_name","") or "default"
+        conn = db()
+        inserted = updated = changed = 0
+        for item in mapped:
+            old = conn.execute("""SELECT * FROM api_symbols
+                                  WHERE provider_name=? AND symbol=?""",
+                               (provider,item["symbol"])).fetchone()
+            old_price = float(old["price"] or 0) if old else None
+            conn.execute("""INSERT INTO api_symbols(
+                              provider_name,external_id,symbol,display_name,price,
+                              quote_currency,raw_json,is_active,updated_at,created_at
+                            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(provider_name,symbol) DO UPDATE SET
+                              external_id=excluded.external_id,
+                              display_name=excluded.display_name,
+                              price=excluded.price,
+                              quote_currency=excluded.quote_currency,
+                              raw_json=excluded.raw_json,
+                              updated_at=excluded.updated_at""",
+                         (provider,item["external_id"],item["symbol"],item["display_name"],
+                          item["price"],item["quote_currency"],item["raw_json"],1,now(),now()))
+            row = conn.execute("""SELECT id,price FROM api_symbols
+                                  WHERE provider_name=? AND symbol=?""",
+                               (provider,item["symbol"])).fetchone()
+            if old:
+                updated += 1
+            else:
+                inserted += 1
+            if old_price is None or float(item["price"]) != old_price:
+                changed += 1
+                record_symbol_price_history(conn,row["id"],item["price"])
+        recalc_count = blocked_count = 0
+        if get_setting("price_engine_recalc_after_sync","on") == "on":
+            recalc_count, blocked_count = recalculate_all_online_products(conn)
+        conn.commit(); conn.close()
+        msg = (f"trigger={trigger} | received={len(mapped)} | new={inserted} | "
+               f"updated={updated} | changed={changed} | skipped={skipped} | "
+               f"products={recalc_count} | blocked={blocked_count}")
+        set_setting("price_api_last_sync_status","ok")
+        set_setting("price_api_last_sync_at",now())
+        set_setting("price_api_last_sync_message",msg)
+        if trigger == "auto":
+            set_setting("price_engine_last_auto_run",now())
+        conn = db()
+        conn.execute("""UPDATE api_sync_logs
+                        SET status='ok',message=?,symbols_count=?,finished_at=?
+                        WHERE id=?""", (msg,len(mapped),now(),log_id))
+        conn.commit(); conn.close()
+        return True,msg
+    except Exception as e:
+        msg = repr(e)
+        set_setting("price_api_last_sync_status","failed")
+        set_setting("price_api_last_sync_at",now())
+        set_setting("price_api_last_sync_message",msg)
+        conn = db()
+        conn.execute("""UPDATE api_sync_logs
+                        SET status='failed',message=?,finished_at=?
+                        WHERE id=?""", (msg,now(),log_id))
+        conn.commit(); conn.close()
+        return False,msg
+
+def price_engine_due():
+    global PRICE_ENGINE_NEXT_RUN
+    if get_setting("price_engine_auto_sync","off") != "on":
+        return False
+    now_ts = time.time()
+    if PRICE_ENGINE_NEXT_RUN <= 0:
+        PRICE_ENGINE_NEXT_RUN = now_ts + 5
+    return now_ts >= PRICE_ENGINE_NEXT_RUN
+
+def run_price_engine_if_due():
+    global PRICE_ENGINE_NEXT_RUN
+    if not price_engine_due():
+        return
+    interval = max(60,min(86400,safe_int(get_setting("price_engine_interval_seconds","300"),300)))
+    PRICE_ENGINE_NEXT_RUN = time.time() + interval
+    ok,msg = run_price_engine_sync("auto")
+    print("PRICE ENGINE:", "OK" if ok else "FAILED", msg)
+
+def price_engine_admin_text():
+    conn = db()
+    symbols = conn.execute("SELECT COUNT(*) n FROM api_symbols").fetchone()["n"]
+    stale = 0
+    for row in conn.execute("SELECT * FROM api_symbols WHERE is_active=1").fetchall():
+        if symbol_is_stale(row):
+            stale += 1
+    online_products = conn.execute("SELECT COUNT(*) n FROM products WHERE price_mode='online'").fetchone()["n"]
+    last_log = conn.execute("SELECT * FROM api_sync_logs ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    last_log_text = "-"
+    if last_log:
+        last_log_text = f"{last_log['status']} | {last_log['finished_at'] or last_log['started_at']} | {last_log['message']}"
+    return f"""⚙️ <b>موتور قیمت‌گذاری خودکار</b>
+
+Auto Sync: <b>{'فعال ✅' if get_setting('price_engine_auto_sync','off')=='on' else 'غیرفعال ❌'}</b>
+بازه بروزرسانی: <code>{get_setting('price_engine_interval_seconds','300')}</code> ثانیه
+حداکثر عمر قیمت: <code>{get_setting('price_engine_max_age_seconds','900')}</code> ثانیه
+سیاست قیمت قدیمی: <code>{html_escape(price_engine_policy())}</code>
+محاسبه محصولات بعد Sync: <code>{get_setting('price_engine_recalc_after_sync','on')}</code>
+ثبت تاریخچه قیمت: <code>{get_setting('price_engine_history_enabled','on')}</code>
+
+تعداد نمادها: <b>{symbols}</b>
+نمادهای قدیمی: <b>{stale}</b>
+محصولات آنلاین: <b>{online_products}</b>
+آخرین اجرای خودکار: {html_escape(get_setting('price_engine_last_auto_run','') or '-')}
+
+آخرین لاگ:
+<code>{html_escape(last_log_text)[:1200]}</code>
+"""
+
+def price_engine_admin_menu():
+    return kb([
+        [btn("🔁 Auto Sync روشن/خاموش","admin:engine_toggle_auto")],
+        [btn("⏱ بازه بروزرسانی","admin:engine_interval"),btn("⌛ حداکثر عمر قیمت","admin:engine_max_age")],
+        [btn("🧯 سیاست: last","admin:engine_policy:last"),btn("🛟 fallback","admin:engine_policy:fallback"),btn("⛔ block","admin:engine_policy:block")],
+        [btn("🧮 محاسبه بعد Sync","admin:engine_toggle_recalc"),btn("📈 ثبت تاریخچه","admin:engine_toggle_history")],
+        [btn("🔄 اجرای Sync حالا","admin:engine_run_now")],
+        [btn("🧮 محاسبه همه محصولات","admin:engine_recalc_all")],
+        [btn("📜 لاگ‌های Sync","admin:engine_logs"),btn("📈 تاریخچه قیمت","admin:engine_history")],
+        [btn("🔙 مدیریت API","admin:price_api")]
+    ])
+
+def price_engine_logs_text():
+    conn=db()
+    rows=conn.execute("SELECT * FROM api_sync_logs ORDER BY id DESC LIMIT 25").fetchall()
+    conn.close()
+    if not rows:
+        return "📜 لاگ Sync وجود ندارد."
+    lines=["📜 <b>آخرین Syncها</b>\n"]
+    for r in rows:
+        lines.append(f"#{r['id']} | {r['status']} | {r['started_at']} | count:{r['symbols_count']}\n{html_escape(r['message'] or '-')}")
+    return "\n\n".join(lines)
+
+def price_history_text():
+    conn=db()
+    rows=conn.execute("""SELECT h.*,s.symbol FROM api_price_history h
+                         LEFT JOIN api_symbols s ON s.id=h.symbol_id
+                         ORDER BY h.id DESC LIMIT 30""").fetchall()
+    conn.close()
+    if not rows:
+        return "📈 تاریخچه قیمتی ثبت نشده است."
+    lines=["📈 <b>آخرین تغییرات قیمت</b>\n"]
+    for r in rows:
+        price_text=f"{r['price']:,.12f}".rstrip("0").rstrip(".")
+        lines.append(f"{html_escape(r['symbol'] or '-')} | <code>{price_text}</code> | {r['recorded_at']}")
+    return "\n".join(lines)
+
 # -------------------- Product Online Price Engine --------------------
 
 def product_price_mode(p):
@@ -788,6 +1024,8 @@ def calculate_product_price_from_rows(p, symbol_row=None):
         return max(0, int(p["price"] or 0)), "fixed"
 
     source_price = float(symbol_row["price"] or 0) if symbol_row else 0.0
+    stale = symbol_is_stale(symbol_row)
+    stale_policy = price_engine_policy()
     multiplier = float(p["price_multiplier"] or 1)
     profit_percent = float(p["profit_percent"] or 0)
     fixed_fee = int(p["fixed_fee"] or 0)
@@ -798,10 +1036,16 @@ def calculate_product_price_from_rows(p, symbol_row=None):
     if source_price <= 0:
         result = fallback
         source = "fallback"
+    elif stale and stale_policy == "block":
+        result = 0
+        source = "stale_block"
+    elif stale and stale_policy == "fallback":
+        result = fallback
+        source = "stale_fallback"
     else:
         base = source_price * multiplier
         result = round(base + (base * profit_percent / 100.0) + fixed_fee)
-        source = "api"
+        source = "stale_last" if stale else "api"
 
     result = max(0, int(result))
     if min_price > 0 and result < min_price:
@@ -1479,6 +1723,7 @@ def price_api_admin_menu():
         [btn("🧪 Test Endpoint", "admin:price_api_set_test_endpoint"), btn("⏱ Timeout", "admin:price_api_set_timeout")],
         [btn("🔍 تست اتصال", "admin:price_api_test")],
         [btn("🧩 تنظیم نمادها و قیمت‌ها", "admin:api_mapper")],
+        [btn("⚙️ موتور قیمت خودکار", "admin:price_engine")],
         [btn("💱 لیست نمادها", "admin:api_symbols:0")],
         [btn("🗑 حذف API Key", "admin:price_api_clear_key")],
         [btn("🔙 پنل ادمین", "admin:home")]
@@ -2470,6 +2715,53 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
+    if data=="admin:price_engine":
+        return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
+
+    if data=="admin:engine_toggle_auto":
+        cur=get_setting("price_engine_auto_sync","off")
+        set_setting("price_engine_auto_sync","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
+
+    if data=="admin:engine_toggle_recalc":
+        cur=get_setting("price_engine_recalc_after_sync","on")
+        set_setting("price_engine_recalc_after_sync","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
+
+    if data=="admin:engine_toggle_history":
+        cur=get_setting("price_engine_history_enabled","on")
+        set_setting("price_engine_history_enabled","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
+
+    if data.startswith("admin:engine_policy:"):
+        policy=data.split(":")[2]
+        if policy in ("last","fallback","block"):
+            set_setting("price_engine_stale_policy",policy)
+        return edit_message(chat_id,message_id,price_engine_admin_text(),price_engine_admin_menu())
+
+    if data=="admin:engine_interval":
+        set_state(tg_id,"engine_interval")
+        return edit_message(chat_id,message_id,"بازه بروزرسانی را به ثانیه بفرست؛ بین 60 تا 86400:",admin_back())
+
+    if data=="admin:engine_max_age":
+        set_state(tg_id,"engine_max_age")
+        return edit_message(chat_id,message_id,"حداکثر عمر معتبر قیمت را به ثانیه بفرست؛ حداقل 30:",admin_back())
+
+    if data=="admin:engine_run_now":
+        ok,msg=run_price_engine_sync("manual")
+        prefix="✅" if ok else "❌"
+        return edit_message(chat_id,message_id,f"{prefix} {html_escape(msg)}",price_engine_admin_menu())
+
+    if data=="admin:engine_recalc_all":
+        updated,blocked=recalculate_all_online_products()
+        return edit_message(chat_id,message_id,f"✅ محصولات محاسبه شدند.\nتعداد: {updated}\nبدون قیمت معتبر: {blocked}",price_engine_admin_menu())
+
+    if data=="admin:engine_logs":
+        return edit_message(chat_id,message_id,price_engine_logs_text(),kb([[btn("🔙 موتور قیمت","admin:price_engine")]]))
+
+    if data=="admin:engine_history":
+        return edit_message(chat_id,message_id,price_history_text(),kb([[btn("🔙 موتور قیمت","admin:price_engine")]]))
+
     if data=="admin:api_mapper":
         return edit_message(chat_id,message_id,api_mapper_admin_text(),api_mapper_admin_menu())
 
@@ -3323,6 +3615,16 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="engine_interval":
+            value=max(60,min(86400,safe_int(only_digits(text),300)))
+            set_setting("price_engine_interval_seconds",str(value))
+            send_message(chat_id,f"✅ بازه روی {value} ثانیه تنظیم شد.",price_engine_admin_menu()); return True
+
+        if name=="engine_max_age":
+            value=max(30,min(604800,safe_int(only_digits(text),900)))
+            set_setting("price_engine_max_age_seconds",str(value))
+            send_message(chat_id,f"✅ حداکثر عمر روی {value} ثانیه تنظیم شد.",price_engine_admin_menu()); return True
+
         if name=="api_symbols_search":
             query=text.strip()
             conn=db()
@@ -3666,6 +3968,9 @@ def handle_message(message):
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         text_out, markup=api_symbols_list_text(0)
         return send_message(chat_id,text_out,markup)
+    if text=="/priceengine":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,price_engine_admin_text(),price_engine_admin_menu())
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
@@ -3700,6 +4005,7 @@ def polling_loop():
     offset=0
     while True:
         try:
+            run_price_engine_if_due()
             updates=tg("getUpdates",{"timeout":30,"offset":offset,"allowed_updates":["message","callback_query"]},45)
             for upd in updates:
                 offset=upd["update_id"]+1
