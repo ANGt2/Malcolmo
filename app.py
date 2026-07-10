@@ -61,6 +61,11 @@ Part 03 adds:
 - configurable operational alerts
 - supplier, product and customer analytics
 - scheduled alert checks and admin notifications
+- enterprise business intelligence dashboard
+- sales/profit trend analytics and period comparisons
+- inventory depletion forecasts and dormant stock analysis
+- provider reliability analytics
+- advanced finance search and management exports
 """
 
 import os, json, time, sqlite3, urllib.request, urllib.error, traceback, csv, io, hashlib
@@ -756,6 +761,10 @@ def init_db():
         "finance_pending_order_hours": "6",
         "finance_expiry_warning_days": "7",
         "finance_price_deviation_percent": "10",
+        "bi_default_period_days": "30",
+        "bi_inventory_forecast_days": "30",
+        "bi_dormant_stock_days": "30",
+        "bi_provider_window_days": "7",
     }
     for k,v in defaults.items():
         c.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k,v))
@@ -1202,6 +1211,7 @@ def finance_dashboard_menu(period="today"):
         [btn("سال", "admin:finance:year"), btn("کل", "admin:finance:all")],
         [btn("📜 آخرین تراکنش‌ها", "admin:finance_transactions:0")],
         [btn("📊 گزارش‌های پیشرفته", "admin:finance_reports")],
+        [btn("🧠 داشبورد هوشمند BI", "admin:bi:30")],
         [btn("🔄 بازسازی مالی سفارش‌ها", "admin:finance_rebuild_confirm")],
         [btn("📤 خروجی CSV", "admin:finance_export_csv"),
          btn("📤 خروجی JSON", "admin:finance_export_json")],
@@ -1623,6 +1633,266 @@ def run_finance_alerts_if_due():
             send_message(OWNER_ID, f"⚠️ {len(created)} هشدار جدید در MVLite ثبت شد.", finance_alerts_menu())
         except Exception as e:
             print("FINANCE ALERT NOTIFY ERROR:", repr(e))
+
+
+# -------------------- Enterprise BI Dashboard --------------------
+
+BI_SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+def bi_safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+def bi_sparkline(values):
+    clean=[bi_safe_float(v,0) for v in values]
+    if not clean: return "-"
+    lo=min(clean); hi=max(clean)
+    if hi==lo: return BI_SPARK_CHARS[3]*len(clean)
+    out=[]
+    for value in clean:
+        idx=int(round((value-lo)*(len(BI_SPARK_CHARS)-1)/(hi-lo)))
+        out.append(BI_SPARK_CHARS[max(0,min(len(BI_SPARK_CHARS)-1,idx))])
+    return "".join(out)
+
+def bi_percent_change(current, previous):
+    current=bi_safe_float(current); previous=bi_safe_float(previous)
+    if previous==0:
+        return 0.0 if current==0 else 100.0
+    return round((current-previous)*100.0/abs(previous),2)
+
+def bi_period_metrics(days=30, offset_days=0):
+    days=max(1,min(3650,int(days))); offset_days=max(0,int(offset_days))
+    conn=db()
+    row=conn.execute("""SELECT COUNT(*) orders_count,
+        COALESCE(SUM(sale_amount),0) sales,
+        COALESCE(SUM(purchase_cost),0) costs,
+        COALESCE(SUM(gross_profit),0) gross_profit,
+        COALESCE(SUM(net_profit),0) net_profit,
+        COALESCE(AVG(sale_amount),0) avg_order
+        FROM profit_snapshots
+        WHERE datetime(created_at)>=datetime('now','localtime',?)
+          AND datetime(created_at)<datetime('now','localtime',?)""",
+        (f"-{days+offset_days} days",f"-{offset_days} days" if offset_days else "+1 second")).fetchone()
+    refunds=conn.execute("""SELECT COALESCE(SUM(amount),0) n
+        FROM finance_transactions WHERE tx_type='refund'
+        AND datetime(created_at)>=datetime('now','localtime',?)
+        AND datetime(created_at)<datetime('now','localtime',?)""",
+        (f"-{days+offset_days} days",f"-{offset_days} days" if offset_days else "+1 second")).fetchone()["n"]
+    conn.close()
+    return {
+        "orders":int(row["orders_count"] or 0),"sales":int(row["sales"] or 0),
+        "costs":int(row["costs"] or 0),"gross_profit":int(row["gross_profit"] or 0),
+        "net_profit":int(row["net_profit"] or 0),"avg_order":int(row["avg_order"] or 0),
+        "refunds":int(refunds or 0)
+    }
+
+def bi_daily_series(days=14):
+    days=max(7,min(120,int(days)))
+    conn=db()
+    rows=conn.execute("""WITH RECURSIVE dates(d) AS (
+        SELECT date('now','localtime',?)
+        UNION ALL SELECT date(d,'+1 day') FROM dates WHERE d<date('now','localtime'))
+        SELECT d day,COALESCE(SUM(ps.sale_amount),0) sales,
+        COALESCE(SUM(ps.net_profit),0) profit,COUNT(ps.id) orders_count
+        FROM dates LEFT JOIN profit_snapshots ps ON substr(ps.created_at,1,10)=d
+        GROUP BY d ORDER BY d""",(f"-{days-1} days",)).fetchall()
+    conn.close(); return rows
+
+def bi_inventory_summary():
+    normalize_stock_statuses()
+    conn=db()
+    row=conn.execute("""SELECT COUNT(*) total_codes,
+        SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) available_codes,
+        SUM(CASE WHEN status='used' THEN 1 ELSE 0 END) used_codes,
+        SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) expired_codes,
+        COALESCE(SUM(CASE WHEN status='available' THEN unit_cost ELSE 0 END),0) available_value,
+        COALESCE(AVG(CASE WHEN status='available' THEN unit_cost END),0) avg_unit_cost
+        FROM product_codes""").fetchone()
+    conn.close(); return {k:int(row[k] or 0) for k in row.keys()}
+
+def bi_provider_summary():
+    window=max(1,safe_int(get_setting("bi_provider_window_days","7"),7))
+    conn=db()
+    rows=conn.execute("""SELECT p.id,p.name,p.role,p.is_active,p.last_status,
+        p.last_latency_ms,p.last_checked_at,COUNT(e.id) checks,
+        SUM(CASE WHEN e.status='ok' THEN 1 ELSE 0 END) ok_checks,
+        SUM(CASE WHEN e.status!='ok' THEN 1 ELSE 0 END) failed_checks,
+        COALESCE(AVG(CASE WHEN e.latency_ms>0 THEN e.latency_ms END),0) avg_latency
+        FROM api_providers p LEFT JOIN api_provider_events e
+        ON e.provider_id=p.id AND datetime(e.created_at)>=datetime('now','localtime',?)
+        GROUP BY p.id ORDER BY CASE WHEN p.role='primary' THEN 0 ELSE 1 END,p.priority,p.id""",
+        (f"-{window} days",)).fetchall()
+    conn.close()
+    result=[]
+    for r in rows:
+        checks=int(r["checks"] or 0); ok=int(r["ok_checks"] or 0)
+        result.append({
+            "id":r["id"],"name":r["name"],"role":r["role"],"is_active":r["is_active"],
+            "last_status":r["last_status"],"last_latency_ms":int(r["last_latency_ms"] or 0),
+            "last_checked_at":r["last_checked_at"] or "","checks":checks,"ok_checks":ok,
+            "failed_checks":int(r["failed_checks"] or 0),"avg_latency":int(r["avg_latency"] or 0),
+            "success_rate":round(ok*100.0/checks,2) if checks else 0.0
+        })
+    return result
+
+def bi_inventory_forecast_rows(limit=20):
+    dormant_days=max(1,safe_int(get_setting("bi_dormant_stock_days","30"),30))
+    conn=db()
+    rows=conn.execute("""SELECT p.id,p.title,p.low_stock_threshold,
+        SUM(CASE WHEN pc.status='available' THEN 1 ELSE 0 END) available_count,
+        COALESCE(SUM(CASE WHEN pc.status='available' THEN pc.unit_cost ELSE 0 END),0) inventory_value,
+        COALESCE(AVG(CASE WHEN pc.status='available' THEN pc.unit_cost END),0) avg_cost,
+        (SELECT COUNT(*) FROM product_codes u WHERE u.product_id=p.id AND u.status='used'
+         AND datetime(u.used_at)>=datetime('now','localtime',?)) used_recent
+        FROM products p LEFT JOIN product_codes pc ON pc.product_id=p.id
+        WHERE p.stock_mode='code' GROUP BY p.id,p.title,p.low_stock_threshold
+        ORDER BY available_count ASC,p.id LIMIT ?""",(f"-{dormant_days} days",limit)).fetchall()
+    conn.close()
+    result=[]
+    for r in rows:
+        available=int(r["available_count"] or 0); used_recent=int(r["used_recent"] or 0)
+        daily_rate=used_recent/float(dormant_days)
+        days_left=round(available/daily_rate,1) if daily_rate>0 else None
+        result.append({
+            "id":r["id"],"title":r["title"],"available":available,"used_recent":used_recent,
+            "daily_rate":daily_rate,"days_left":days_left,
+            "inventory_value":int(r["inventory_value"] or 0),"avg_cost":int(r["avg_cost"] or 0),
+            "low_threshold":int(r["low_stock_threshold"] or 0),"dormant":used_recent==0 and available>0
+        })
+    return result
+
+def bi_dashboard_text(days=None):
+    days=days or safe_int(get_setting("bi_default_period_days","30"),30)
+    current=bi_period_metrics(days,0); previous=bi_period_metrics(days,days)
+    daily=bi_daily_series(min(days,30)); inventory=bi_inventory_summary(); providers=bi_provider_summary()
+    sales_change=bi_percent_change(current["sales"],previous["sales"])
+    profit_change=bi_percent_change(current["net_profit"],previous["net_profit"])
+    order_change=bi_percent_change(current["orders"],previous["orders"])
+    healthy=sum(1 for p in providers if p["last_status"]=="ok" and p["is_active"])
+    active=sum(1 for p in providers if p["is_active"])
+    return f"""📊 <b>داشبورد هوشمند MVLite — {days} روز</b>
+
+💰 فروش: <b>{money(current['sales'])}</b> تومان
+تغییر دوره‌ای: <b>{sales_change:+.2f}%</b>
+{bi_sparkline([r['sales'] for r in daily])}
+
+📈 سود خالص: <b>{money(current['net_profit'])}</b> تومان
+تغییر دوره‌ای: <b>{profit_change:+.2f}%</b>
+{bi_sparkline([r['profit'] for r in daily])}
+
+🧾 سفارش‌ها: <b>{current['orders']}</b>
+تغییر دوره‌ای: <b>{order_change:+.2f}%</b>
+میانگین سفارش: <b>{money(current['avg_order'])}</b> تومان
+Refund: <b>{money(current['refunds'])}</b> تومان
+
+📦 موجودی آماده: <b>{inventory['available_codes']}</b> کد
+ارزش موجودی: <b>{money(inventory['available_value'])}</b> تومان
+کد منقضی: <b>{inventory['expired_codes']}</b>
+
+🌐 Provider سالم: <b>{healthy}/{active}</b>
+"""
+
+def bi_dashboard_menu(days=30):
+    return kb([
+        [btn("۷ روز","admin:bi:7"),btn("۳۰ روز","admin:bi:30"),btn("۹۰ روز","admin:bi:90")],
+        [btn("📈 روند روزانه","admin:bi_trends"),btn("🏆 رتبه‌بندی","admin:bi_rankings")],
+        [btn("📦 پیش‌بینی موجودی","admin:bi_inventory"),btn("🌐 تحلیل Providerها","admin:bi_providers")],
+        [btn("🔍 جستجوی پیشرفته","admin:bi_search")],
+        [btn("📤 خروجی JSON","admin:bi_export_json"),btn("📤 خروجی CSV","admin:bi_export_csv")],
+        [btn("🔙 مرکز مالی","admin:finance:today")]
+    ])
+
+def bi_trends_text(days=30):
+    rows=bi_daily_series(days); lines=[f"📈 <b>روند روزانه — {days} روز</b>\n"]
+    for r in rows:
+        lines.append(f"{r['day']} | سفارش: {r['orders_count']} | فروش: {money(r['sales'])} | سود: {money(r['profit'])}")
+    return "\n".join(lines)
+
+def bi_rankings_text():
+    products=product_finance_report("month",10)
+    customers=customer_finance_report("month",10)
+    suppliers=supplier_finance_report(10)
+    lines=["🏆 <b>رتبه‌بندی ماه جاری</b>\n","📦 <b>محصولات</b>"]
+    for i,r in enumerate(products,1):
+        lines.append(f"{i}. {html_escape(r['product_title'] or '-')} — فروش {money(r['sales'])} | سود {money(r['profit'])}")
+    lines.append("\n👥 <b>مشتریان</b>")
+    for i,r in enumerate(customers,1):
+        name=r["username"] and f"@{r['username']}" or r["first_name"] or str(r["user_id"])
+        lines.append(f"{i}. {html_escape(name)} — خرید {money(r['sales'])}")
+    lines.append("\n🏭 <b>تأمین‌کننده‌ها</b>")
+    for i,r in enumerate(suppliers,1):
+        lines.append(f"{i}. {html_escape(r['supplier_name'] or '-')} — ارزش خرید {money(r['purchased_value'])}")
+    return "\n".join(lines)
+
+def bi_inventory_text():
+    rows=bi_inventory_forecast_rows(); lines=["📦 <b>پیش‌بینی موجودی ووچرها</b>\n"]
+    if not rows: lines.append("داده‌ای وجود ندارد.")
+    for r in rows:
+        forecast=("راکد / بدون فروش اخیر" if r["dormant"] else "نامشخص") if r["days_left"] is None else f"حدود {r['days_left']} روز"
+        risk="🔴" if r["available"]<=r["low_threshold"] else ("🟡" if r["days_left"] is not None and r["days_left"]<=7 else "🟢")
+        lines.append(f"{risk} <b>{html_escape(r['title'])}</b>\nموجودی: {r['available']} | فروش اخیر: {r['used_recent']} | اتمام: {forecast}\nارزش: {money(r['inventory_value'])} تومان")
+    return "\n\n".join(lines)
+
+def bi_providers_text():
+    rows=bi_provider_summary(); lines=["🌐 <b>تحلیل Providerها</b>\n"]
+    if not rows: lines.append("Provider ثبت نشده است.")
+    for r in rows:
+        icon="🟢" if r["last_status"]=="ok" else ("⚪" if r["last_status"]=="never" else "🔴")
+        lines.append(f"{icon} <b>{html_escape(r['name'])}</b> | {html_escape(r['role'])}\nموفقیت: {r['success_rate']:.2f}% | بررسی: {r['checks']} | خطا: {r['failed_checks']}\nLatency میانگین: {r['avg_latency']}ms | آخرین: {r['last_latency_ms']}ms")
+    return "\n\n".join(lines)
+
+def bi_search_results(query):
+    q=str(query or "").strip()
+    if not q: return "عبارت جستجو خالی است."
+    conn=db(); like=f"%{q}%"
+    orders=conn.execute("""SELECT id,order_code,user_id,product_title_snapshot,status,final_amount,created_at
+        FROM orders WHERE order_code LIKE ? OR CAST(user_id AS TEXT) LIKE ?
+        OR product_title_snapshot LIKE ? OR status LIKE ? ORDER BY id DESC LIMIT 20""",
+        (like,like,like,like)).fetchall()
+    txs=conn.execute("""SELECT id,tx_code,tx_type,amount,order_id,user_id,created_at
+        FROM finance_transactions WHERE tx_code LIKE ? OR tx_type LIKE ?
+        OR CAST(order_id AS TEXT) LIKE ? OR CAST(user_id AS TEXT) LIKE ?
+        ORDER BY id DESC LIMIT 20""",(like,like,like,like)).fetchall()
+    products=conn.execute("""SELECT id,title,price,stock_mode,is_active FROM products
+        WHERE title LIKE ? OR CAST(id AS TEXT) LIKE ? ORDER BY id DESC LIMIT 20""",(like,like)).fetchall()
+    conn.close()
+    lines=[f"🔍 <b>نتایج جستجو:</b> {html_escape(q)}\n","🧾 <b>سفارش‌ها</b>"]
+    if not orders: lines.append("موردی نبود.")
+    for r in orders: lines.append(f"#{r['id']} {html_escape(r['order_code'])} | {html_escape(r['product_title_snapshot'] or '-')} | {html_escape(r['status'])} | {money(r['final_amount'])}")
+    lines.append("\n💰 <b>تراکنش‌ها</b>")
+    if not txs: lines.append("موردی نبود.")
+    for r in txs: lines.append(f"#{r['id']} {html_escape(r['tx_code'])} | {html_escape(r['tx_type'])} | {money(r['amount'])}")
+    lines.append("\n📦 <b>محصولات</b>")
+    if not products: lines.append("موردی نبود.")
+    for r in products: lines.append(f"#{r['id']} {html_escape(r['title'])} | {money(r['price'])} | {html_escape(r['stock_mode'])}")
+    return "\n".join(lines)
+
+def bi_export_payload():
+    days=safe_int(get_setting("bi_default_period_days","30"),30)
+    return {
+        "generated_at":now(),"period_days":days,
+        "metrics":bi_period_metrics(days,0),"previous_period":bi_period_metrics(days,days),
+        "daily_series":[dict(r) for r in bi_daily_series(min(days,30))],
+        "inventory":bi_inventory_summary(),"inventory_forecast":bi_inventory_forecast_rows(),
+        "providers":bi_provider_summary(),
+        "top_products":[dict(r) for r in product_finance_report("month",20)],
+        "top_customers":[dict(r) for r in customer_finance_report("month",20)],
+        "suppliers":[dict(r) for r in supplier_finance_report(20)]
+    }
+
+def bi_export_json_text():
+    return json.dumps(bi_export_payload(),ensure_ascii=False,indent=2)
+
+def bi_export_csv_text():
+    payload=bi_export_payload(); output=io.StringIO(); writer=csv.writer(output)
+    writer.writerow(["section","name","value"])
+    for k,v in payload["metrics"].items(): writer.writerow(["metrics",k,v])
+    for k,v in payload["inventory"].items(): writer.writerow(["inventory",k,v])
+    for row in payload["inventory_forecast"]: writer.writerow(["inventory_forecast",row["title"],json.dumps(row,ensure_ascii=False)])
+    for row in payload["providers"]: writer.writerow(["provider",row["name"],json.dumps(row,ensure_ascii=False)])
+    return output.getvalue()
 
 # -------------------- State --------------------
 
@@ -5232,6 +5502,34 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
         conn.commit(); conn.close()
         return edit_message(chat_id,message_id,f"✅ {count} هشدار بسته شد.",finance_alerts_menu())
 
+    if data.startswith("admin:bi:"):
+        days=max(7,min(365,safe_int(data.split(":")[2],30)))
+        return edit_message(chat_id,message_id,bi_dashboard_text(days),bi_dashboard_menu(days))
+
+    if data=="admin:bi_trends":
+        return edit_message(chat_id,message_id,bi_trends_text(30),kb([[btn("🔙 داشبورد BI","admin:bi:30")]]))
+
+    if data=="admin:bi_rankings":
+        return edit_message(chat_id,message_id,bi_rankings_text(),kb([[btn("🔙 داشبورد BI","admin:bi:30")]]))
+
+    if data=="admin:bi_inventory":
+        return edit_message(chat_id,message_id,bi_inventory_text(),kb([[btn("🔙 داشبورد BI","admin:bi:30")]]))
+
+    if data=="admin:bi_providers":
+        return edit_message(chat_id,message_id,bi_providers_text(),kb([[btn("🔙 داشبورد BI","admin:bi:30")]]))
+
+    if data=="admin:bi_search":
+        set_state(tg_id,"bi_search")
+        return edit_message(chat_id,message_id,"عبارت جستجو را ارسال کن؛ شماره سفارش، کاربر، محصول یا تراکنش:",admin_back())
+
+    if data=="admin:bi_export_json":
+        send_text_file(chat_id,f"mvlite_bi_{int(time.time())}.json",bi_export_json_text(),"🧠 خروجی BI JSON")
+        return edit_message(chat_id,message_id,"✅ خروجی JSON ارسال شد.",bi_dashboard_menu(30))
+
+    if data=="admin:bi_export_csv":
+        send_text_file(chat_id,f"mvlite_bi_{int(time.time())}.csv",bi_export_csv_text(),"🧠 خروجی BI CSV")
+        return edit_message(chat_id,message_id,"✅ خروجی CSV ارسال شد.",bi_dashboard_menu(30))
+
     if data=="admin:price_api":
         return edit_message(chat_id,message_id,price_api_admin_text(),price_api_admin_menu())
 
@@ -6520,6 +6818,9 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="bi_search":
+            send_message(chat_id,bi_search_results(text.strip()),kb([[btn("🔙 داشبورد BI","admin:bi:30")]])); return True
+
         if name=="finance_alerts_interval":
             value=max(60,min(86400,safe_int(only_digits(text),300)))
             set_setting("finance_alerts_interval_seconds",str(value))
@@ -6975,6 +7276,9 @@ def handle_message(message):
     if text=="/financereports":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,"📊 گزارش‌های پیشرفته مالی",finance_reports_menu())
+    if text=="/bi":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,bi_dashboard_text(30),bi_dashboard_menu(30))
 
     if text=="/admin":
         if not is_admin(tg_id): return send_message(chat_id,"❌ شما ادمین نیستید.\nاگر اولین اجراست، /claim_admin را بزنید.")
