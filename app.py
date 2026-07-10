@@ -518,6 +518,10 @@ def init_db():
         "multi_provider_failover_enabled": "on",
         "multi_provider_health_interval": "300",
         "multi_provider_last_health_at": "",
+        "provider_health_auto_check": "off",
+        "provider_health_check_interval": "300",
+        "provider_health_event_retention": "500",
+        "provider_health_last_auto_run": "",
         "price_api_last_sync_status": "never",
         "price_api_last_sync_at": "",
         "price_api_last_sync_message": "",
@@ -844,6 +848,229 @@ def admin_payment_detail_menu(pay_id):
 
 
 
+
+# -------------------- Provider Backup / Health Monitor --------------------
+
+PROVIDER_HEALTH_NEXT_RUN = 0
+
+def provider_export_dict(row):
+    return {
+        "format": "mvlite-api-provider-v1",
+        "name": row["name"],
+        "profile_id": row["profile_id"] or "",
+        "base_url": row["base_url"] or "",
+        "api_key": "",
+        "auth_header": row["auth_header"] or "Authorization",
+        "auth_prefix": row["auth_prefix"] or "",
+        "symbols_endpoint": row["symbols_endpoint"] or "",
+        "symbols_method": row["symbols_method"] or "GET",
+        "query_json": row["query_json"] or "{}",
+        "body_json": row["body_json"] or "{}",
+        "list_path": row["list_path"] or "",
+        "symbol_path": row["symbol_path"] or "symbol",
+        "name_path": row["name_path"] or "name",
+        "price_path": row["price_path"] or "price",
+        "id_path": row["id_path"] or "id",
+        "quote_path": row["quote_path"] or "quote",
+        "dict_key_as_symbol": int(row["dict_key_as_symbol"] or 0),
+        "timeout_seconds": int(row["timeout_seconds"] or 20),
+        "priority": int(row["priority"] or 100),
+        "role": row["role"] or "backup",
+        "is_active": int(row["is_active"] or 0),
+    }
+
+def export_provider_json(provider_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM api_providers WHERE id=?", (provider_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise RuntimeError("Provider پیدا نشد.")
+    payload = provider_export_dict(row)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+def import_provider_json(payload):
+    if not isinstance(payload, dict):
+        raise RuntimeError("ساختار فایل معتبر نیست.")
+    if payload.get("format") != "mvlite-api-provider-v1":
+        raise RuntimeError("فرمت Provider پشتیبانی نمی‌شود.")
+
+    name = str(payload.get("name") or "Imported Provider").strip()
+    conn = db()
+    conn.execute("""INSERT INTO api_providers(
+                    name,profile_id,base_url,api_key,auth_header,auth_prefix,
+                    symbols_endpoint,symbols_method,query_json,body_json,list_path,
+                    symbol_path,name_path,price_path,id_path,quote_path,
+                    dict_key_as_symbol,timeout_seconds,priority,role,is_active,
+                    created_at,updated_at
+                  ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 (
+                     name,
+                     str(payload.get("profile_id") or ""),
+                     str(payload.get("base_url") or ""),
+                     "",
+                     str(payload.get("auth_header") or "Authorization"),
+                     str(payload.get("auth_prefix") or ""),
+                     str(payload.get("symbols_endpoint") or ""),
+                     str(payload.get("symbols_method") or "GET").upper(),
+                     json.dumps(payload.get("query_json") if isinstance(payload.get("query_json"), dict) else json.loads(str(payload.get("query_json") or "{}")), ensure_ascii=False, separators=(",",":")),
+                     json.dumps(payload.get("body_json") if isinstance(payload.get("body_json"), dict) else json.loads(str(payload.get("body_json") or "{}")), ensure_ascii=False, separators=(",",":")),
+                     str(payload.get("list_path") or ""),
+                     str(payload.get("symbol_path") or "symbol"),
+                     str(payload.get("name_path") or "name"),
+                     str(payload.get("price_path") or "price"),
+                     str(payload.get("id_path") or "id"),
+                     str(payload.get("quote_path") or "quote"),
+                     1 if int(payload.get("dict_key_as_symbol") or 0) else 0,
+                     max(3, min(60, int(payload.get("timeout_seconds") or 20))),
+                     max(0, min(9999, int(payload.get("priority") or 100))),
+                     "primary" if str(payload.get("role") or "backup") == "primary" else "backup",
+                     1 if int(payload.get("is_active") or 0) else 0,
+                     now(),
+                     now(),
+                 ))
+    provider_id = conn.execute("SELECT last_insert_rowid() x").fetchone()["x"]
+    conn.commit(); conn.close()
+    return provider_id
+
+def clone_provider(provider_id):
+    conn = db()
+    row = conn.execute("SELECT * FROM api_providers WHERE id=?", (provider_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise RuntimeError("Provider پیدا نشد.")
+    payload = provider_export_dict(row)
+    payload["name"] = f"{payload['name']} Copy"
+    payload["role"] = "backup"
+    payload["priority"] = min(9999, int(payload["priority"]) + 10)
+    payload["is_active"] = 0
+    return import_provider_json(payload)
+
+def cleanup_provider_events():
+    keep = max(50, min(10000, safe_int(get_setting("provider_health_event_retention","500"),500)))
+    conn = db()
+    conn.execute("""DELETE FROM api_provider_events
+                    WHERE id NOT IN (
+                      SELECT id FROM api_provider_events
+                      ORDER BY id DESC LIMIT ?
+                    )""", (keep,))
+    deleted = conn.total_changes
+    conn.commit(); conn.close()
+    return deleted
+
+def run_all_provider_health_checks(trigger="manual"):
+    conn = db()
+    rows = conn.execute("""SELECT id,name FROM api_providers
+                           WHERE is_active=1
+                           ORDER BY priority ASC,id ASC""").fetchall()
+    conn.close()
+
+    results = []
+    healthy = 0
+    for row in rows:
+        ok, latency, message = check_provider(row["id"])
+        if ok:
+            healthy += 1
+        results.append({
+            "id": row["id"],
+            "name": row["name"],
+            "ok": ok,
+            "latency": latency,
+            "message": message,
+        })
+
+    set_setting("multi_provider_last_health_at", now())
+    if trigger == "auto":
+        set_setting("provider_health_last_auto_run", now())
+    cleanup_provider_events()
+    return healthy, len(results), results
+
+def provider_health_due():
+    global PROVIDER_HEALTH_NEXT_RUN
+    if get_setting("provider_health_auto_check","off") != "on":
+        return False
+    current = time.time()
+    if PROVIDER_HEALTH_NEXT_RUN <= 0:
+        PROVIDER_HEALTH_NEXT_RUN = current + 10
+    return current >= PROVIDER_HEALTH_NEXT_RUN
+
+def run_provider_health_if_due():
+    global PROVIDER_HEALTH_NEXT_RUN
+    if not provider_health_due():
+        return
+    interval = max(60, min(86400, safe_int(get_setting("provider_health_check_interval","300"),300)))
+    PROVIDER_HEALTH_NEXT_RUN = time.time() + interval
+    healthy, total, _ = run_all_provider_health_checks("auto")
+    print(f"PROVIDER HEALTH: {healthy}/{total} healthy")
+
+def provider_health_dashboard_text():
+    conn = db()
+    rows = conn.execute("""SELECT * FROM api_providers
+                           ORDER BY CASE WHEN role='primary' THEN 0 ELSE 1 END,
+                                    priority ASC,id ASC""").fetchall()
+    events = conn.execute("""SELECT e.*,p.name provider_name
+                             FROM api_provider_events e
+                             LEFT JOIN api_providers p ON p.id=e.provider_id
+                             ORDER BY e.id DESC LIMIT 10""").fetchall()
+    conn.close()
+
+    lines = [
+        "🩺 <b>داشبورد سلامت Providerها</b>\n",
+        f"بررسی خودکار: <b>{'فعال ✅' if get_setting('provider_health_auto_check','off')=='on' else 'غیرفعال ❌'}</b>",
+        f"بازه بررسی: <code>{get_setting('provider_health_check_interval','300')}</code> ثانیه",
+        f"آخرین بررسی: {html_escape(get_setting('multi_provider_last_health_at','') or '-')}",
+        f"آخرین بررسی خودکار: {html_escape(get_setting('provider_health_last_auto_run','') or '-')}\n",
+    ]
+
+    if not rows:
+        lines.append("Provider ثبت نشده است.")
+    else:
+        for row in rows:
+            icon = "🟢" if row["last_status"] == "ok" else ("⚪" if row["last_status"] == "never" else "🔴")
+            lines.append(
+                f"{icon} #{row['id']} <b>{html_escape(row['name'])}</b> | "
+                f"{html_escape(row['role'])} | {row['last_latency_ms']}ms | "
+                f"{html_escape(row['last_checked_at'] or '-')}"
+            )
+
+    if events:
+        lines.append("\n📜 <b>آخرین رخدادها</b>")
+        for e in events:
+            lines.append(
+                f"• {html_escape(e['provider_name'] or '-')} | "
+                f"{html_escape(e['event_type'])} | {html_escape(e['status'] or '-')} | "
+                f"{e['latency_ms']}ms"
+            )
+    return "\n".join(lines)
+
+def provider_health_dashboard_menu():
+    return kb([
+        [btn("🔁 بررسی خودکار روشن/خاموش","admin:provider_health_toggle")],
+        [btn("⏱ تغییر بازه بررسی","admin:provider_health_interval")],
+        [btn("🧪 بررسی همه الآن","admin:provider_health_run")],
+        [btn("📜 تاریخچه کامل رخدادها","admin:provider_health_events")],
+        [btn("🧹 پاکسازی رخدادهای قدیمی","admin:provider_health_cleanup")],
+        [btn("🔙 مدیریت چند API","admin:providers")]
+    ])
+
+def provider_events_text():
+    conn = db()
+    rows = conn.execute("""SELECT e.*,p.name provider_name
+                           FROM api_provider_events e
+                           LEFT JOIN api_providers p ON p.id=e.provider_id
+                           ORDER BY e.id DESC LIMIT 50""").fetchall()
+    conn.close()
+    if not rows:
+        return "📜 رخدادی ثبت نشده است."
+    lines = ["📜 <b>آخرین رخدادهای Providerها</b>\n"]
+    for e in rows:
+        lines.append(
+            f"#{e['id']} | {html_escape(e['provider_name'] or '-')} | "
+            f"{html_escape(e['event_type'])} | {html_escape(e['status'] or '-')} | "
+            f"{e['latency_ms']}ms | {html_escape(e['created_at'])}\n"
+            f"<code>{html_escape(e['message'] or '-')[:500]}</code>"
+        )
+    return "\n\n".join(lines)
+
 # -------------------- Multi-provider API Manager --------------------
 
 def provider_row_to_config(row):
@@ -1145,6 +1372,7 @@ def multi_provider_admin_menu():
         [btn("🔁 فعال/غیرفعال سیستم","admin:providers_toggle")],
         [btn("🔄 Failover روشن/خاموش","admin:providers_failover_toggle")],
         [btn("➕ ذخیره API فعلی به‌عنوان Provider","admin:provider_add_current")],
+        [btn("📥 واردکردن Provider JSON","admin:provider_import")],
         [btn("🧪 تست همه Providerها","admin:providers_test_all")],
         [btn("🚀 Sync با بهترین Provider","admin:providers_sync_best")],
     ]
@@ -1185,6 +1413,7 @@ def provider_detail_menu(provider_id):
         [btn("🧪 تست اتصال",f"admin:provider_test:{provider_id}")],
         [btn("🔄 Sync از این Provider",f"admin:provider_sync:{provider_id}")],
         [btn("📥 بارگذاری در تنظیمات فعلی",f"admin:provider_load:{provider_id}")],
+        [btn("📤 خروجی JSON",f"admin:provider_export:{provider_id}"), btn("🧬 کپی Provider",f"admin:provider_clone:{provider_id}")],
         [btn("🗑 حذف Provider",f"admin:provider_delete_confirm:{provider_id}")],
         [btn("🔙 چند API","admin:providers")]
     ])
@@ -2357,6 +2586,7 @@ def price_api_admin_menu():
         [btn("🔍 تست اتصال", "admin:price_api_test")],
         [btn("🧰 پروفایل‌های آماده API", "admin:api_profiles")],
         [btn("🌐 مدیریت چند API", "admin:providers")],
+        [btn("🩺 سلامت و بکاپ Providerها", "admin:provider_health")],
         [btn("🧩 تنظیم نمادها و قیمت‌ها", "admin:api_mapper")],
         [btn("⚙️ موتور قیمت خودکار", "admin:price_engine")],
         [btn("💱 لیست نمادها", "admin:api_symbols:0")],
@@ -3352,6 +3582,55 @@ def handle_admin_callback(chat_id,message_id,tg_id,data):
 
     if data=="admin:providers":
         return edit_message(chat_id,message_id,multi_provider_admin_text(),multi_provider_admin_menu())
+
+    if data=="admin:provider_health":
+        return edit_message(chat_id,message_id,provider_health_dashboard_text(),provider_health_dashboard_menu())
+
+    if data=="admin:provider_health_toggle":
+        cur=get_setting("provider_health_auto_check","off")
+        set_setting("provider_health_auto_check","off" if cur=="on" else "on")
+        return edit_message(chat_id,message_id,provider_health_dashboard_text(),provider_health_dashboard_menu())
+
+    if data=="admin:provider_health_interval":
+        set_state(tg_id,"provider_health_interval")
+        return edit_message(chat_id,message_id,"بازه بررسی سلامت را به ثانیه ارسال کن؛ بین 60 تا 86400:",admin_back())
+
+    if data=="admin:provider_health_run":
+        healthy,total,results=run_all_provider_health_checks("manual")
+        lines=[f"🧪 بررسی انجام شد: <b>{healthy}/{total}</b> سالم\n"]
+        for r in results:
+            lines.append(f"{'✅' if r['ok'] else '❌'} #{r['id']} {html_escape(r['name'])} | {r['latency']}ms | {html_escape(r['message'])}")
+        return edit_message(chat_id,message_id,"\n".join(lines),provider_health_dashboard_menu())
+
+    if data=="admin:provider_health_events":
+        return edit_message(chat_id,message_id,provider_events_text(),kb([[btn("🔙 داشبورد سلامت","admin:provider_health")]]))
+
+    if data=="admin:provider_health_cleanup":
+        deleted=cleanup_provider_events()
+        return edit_message(chat_id,message_id,f"✅ پاکسازی انجام شد. حذف‌شده: {deleted}",provider_health_dashboard_menu())
+
+    if data=="admin:provider_import":
+        set_state(tg_id,"provider_import_json")
+        return edit_message(chat_id,message_id,
+            "محتوای JSON خروجی Provider را ارسال کن.\n\nنکته: API Key عمداً در خروجی ذخیره نمی‌شود.",
+            admin_back())
+
+    if data.startswith("admin:provider_export:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        try:
+            content=export_provider_json(provider_id)
+            send_text_file(chat_id,f"mvlite_provider_{provider_id}_{int(time.time())}.json",content,"📤 خروجی Provider")
+            return edit_message(chat_id,message_id,"✅ فایل Provider ارسال شد.",kb([[btn("🔙 Provider",f"admin:provider:{provider_id}")]]))
+        except Exception as e:
+            return edit_message(chat_id,message_id,f"❌ خطا:\n<code>{html_escape(repr(e))}</code>",multi_provider_admin_menu())
+
+    if data.startswith("admin:provider_clone:"):
+        provider_id=safe_int(data.split(":")[2],0)
+        try:
+            new_id=clone_provider(provider_id)
+            return edit_message(chat_id,message_id,f"✅ یک کپی با ID {new_id} ساخته شد.",multi_provider_admin_menu())
+        except Exception as e:
+            return edit_message(chat_id,message_id,f"❌ خطا:\n<code>{html_escape(repr(e))}</code>",multi_provider_admin_menu())
 
     if data=="admin:providers_toggle":
         cur=get_setting("multi_provider_enabled","off")
@@ -4407,6 +4686,20 @@ def handle_state_message(chat_id,tg_id,text,message=None):
 
     conn=db()
     try:
+        if name=="provider_health_interval":
+            value=max(60,min(86400,safe_int(only_digits(text),300)))
+            set_setting("provider_health_check_interval",str(value))
+            send_message(chat_id,f"✅ بازه بررسی روی {value} ثانیه تنظیم شد.",provider_health_dashboard_menu()); return True
+
+        if name=="provider_import_json":
+            try:
+                payload=json.loads(text.strip())
+                provider_id=import_provider_json(payload)
+                send_message(chat_id,f"✅ Provider وارد شد. ID: {provider_id}",multi_provider_admin_menu())
+            except Exception as e:
+                send_message(chat_id,f"❌ واردکردن ناموفق بود:\n<code>{html_escape(repr(e))}</code>",multi_provider_admin_menu())
+            return True
+
         if name=="provider_add_name":
             provider_id=save_current_api_as_provider(text.strip(),role="backup",priority=100)
             send_message(chat_id,f"✅ Provider با ID {provider_id} ساخته شد.",multi_provider_admin_menu()); return True
@@ -4781,6 +5074,9 @@ def handle_message(message):
     if text=="/providers":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
         return send_message(chat_id,multi_provider_admin_text(),multi_provider_admin_menu())
+    if text=="/providerhealth":
+        if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
+        return send_message(chat_id,provider_health_dashboard_text(),provider_health_dashboard_menu())
 
     if text=="/backup":
         if not is_admin(tg_id): return send_message(chat_id,"❌ دسترسی ندارید.")
@@ -4816,6 +5112,7 @@ def polling_loop():
     while True:
         try:
             run_price_engine_if_due()
+            run_provider_health_if_due()
             updates=tg("getUpdates",{"timeout":30,"offset":offset,"allowed_updates":["message","callback_query"]},45)
             for upd in updates:
                 offset=upd["update_id"]+1
